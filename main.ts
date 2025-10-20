@@ -25,8 +25,6 @@ interface AppConfig {
   // 服务配置
   port: number;
   logLevel: string;
-  isServer: boolean; // 是否为服务器模式（使用下游密钥透传）
-  skipAuth: boolean; // 跳过认证（仅用于本地测试）
   // 上游配置
   flowithBase: string;
   flowithRegion: string;
@@ -52,27 +50,6 @@ interface AppConfig {
   // MCP配置
   enableMCP: boolean;
   mcpTools: string[];
-  // 自动删除失败Token配置
-  autoRemoveFailedTokens: boolean;
-  maxTokenFailures: number;
-}
-
-// ============ 用户密钥管理系统 ============
-interface UserKey {
-  key: string;
-  name?: string;
-  allowedModels?: string[]; // 允许使用的模型列表，undefined 表示全部允许
-  createdAt: number;
-  usageCount: number;
-  lastUsedAt?: number;
-  isAdmin: boolean; // 是否为管理员密钥
-}
-
-// ============ Token 失败追踪 ============
-interface TokenFailureTracker {
-  token: string;
-  failures: number;
-  lastFailureAt: number;
 }
 
 // 从环境变量加载配置
@@ -84,13 +61,12 @@ function loadConfigFromEnv(): AppConfig {
     : (flowithRegion ? `https://${flowithRegion}.edge.flowith.net` : `https://edge.flowith.net`);
 
   return {
+    // tokens 不从这里加载，而是通过 syncTokensFromEnv() 统一管理
     tokens: [],
     apiKeys: (Deno.env.get("API_KEYS") ?? "").split(",").map(s => s.trim()).filter(Boolean),
     adminKey: (Deno.env.get("ADMIN_KEY") ?? Deno.env.get("API_KEYS") ?? "").split(",")[0]?.trim() ?? "",
     port: Number(Deno.env.get("PORT") ?? "8787"),
     logLevel: (Deno.env.get("LOG_LEVEL") ?? "info").toLowerCase(),
-    isServer: (Deno.env.get("IS_SERVER") ?? "false").toLowerCase() === "true",
-    skipAuth: (Deno.env.get("SKIP_AUTH") ?? "false").toLowerCase() === "true",
     flowithBase,
     flowithRegion,
     origin,
@@ -109,9 +85,7 @@ function loadConfigFromEnv(): AppConfig {
     enableThinkingInjection: (Deno.env.get("ENABLE_THINKING_INJECTION") ?? "true").toLowerCase() === "true",
     thinkingPrompt: Deno.env.get("THINKING_PROMPT") ?? "Please think step by step before answering.",
     enableMCP: (Deno.env.get("ENABLE_MCP") ?? "true").toLowerCase() === "true",
-    mcpTools: (Deno.env.get("MCP_TOOLS") ?? "web_search,image_gen,code_interpreter").split(",").map(s => s.trim()).filter(Boolean),
-    autoRemoveFailedTokens: (Deno.env.get("AUTO_REMOVE_FAILED_TOKENS") ?? "true").toLowerCase() === "true",
-    maxTokenFailures: Math.max(1, Number(Deno.env.get("MAX_TOKEN_FAILURES") ?? "3"))
+    mcpTools: (Deno.env.get("MCP_TOOLS") ?? "web_search,image_gen,code_interpreter").split(",").map(s => s.trim()).filter(Boolean)
   };
 }
 
@@ -246,145 +220,13 @@ const stats = {
   lastResetTime: Date.now()
 };
 
-// ============ 用户密钥管理器 ============
-class UserKeyManager {
-  private userKeys = new Map<string, UserKey>();
-
-  async loadFromKV(): Promise<void> {
-    if (!kv) return;
-    try {
-      const result = await kv.get<Record<string, UserKey>>(["userKeys"]);
-      if (result.value) {
-        this.userKeys = new Map(Object.entries(result.value));
-        console.log(`[UserKeys] Loaded ${this.userKeys.size} user keys from KV`);
-      }
-    } catch (e) {
-      console.error("[UserKeys] Failed to load:", e);
-    }
-  }
-
-  async saveToKV(): Promise<void> {
-    if (!kv) return;
-    try {
-      await kv.set(["userKeys"], Object.fromEntries(this.userKeys));
-    } catch (e) {
-      console.error("[UserKeys] Failed to save:", e);
-    }
-  }
-
-  async addUserKey(key: string, name?: string, allowedModels?: string[], isAdmin = false): Promise<{ success: boolean; message: string }> {
-    const trimmed = key.trim();
-    if (!trimmed) return { success: false, message: "Key cannot be empty" };
-    if (this.userKeys.has(trimmed)) return { success: false, message: "Key already exists" };
-
-    this.userKeys.set(trimmed, {
-      key: trimmed,
-      name,
-      allowedModels,
-      createdAt: Date.now(),
-      usageCount: 0,
-      isAdmin
-    });
-    await this.saveToKV();
-    return { success: true, message: "User key added successfully" };
-  }
-
-  async removeUserKey(key: string): Promise<{ success: boolean; message: string }> {
-    const trimmed = key.trim();
-    if (!this.userKeys.has(trimmed)) return { success: false, message: "Key not found" };
-    this.userKeys.delete(trimmed);
-    await this.saveToKV();
-    return { success: true, message: "User key removed successfully" };
-  }
-
-  getUserKey(key: string): UserKey | undefined {
-    return this.userKeys.get(key.trim());
-  }
-
-  getAllUserKeys(): UserKey[] {
-    return Array.from(this.userKeys.values());
-  }
-
-  async incrementUsage(key: string): Promise<void> {
-    const userKey = this.userKeys.get(key.trim());
-    if (userKey) {
-      userKey.usageCount++;
-      userKey.lastUsedAt = Date.now();
-      await this.saveToKV();
-    }
-  }
-
-  isModelAllowed(key: string, model: string): boolean {
-    const userKey = this.getUserKey(key);
-    if (!userKey) return false;
-    if (!userKey.allowedModels || userKey.allowedModels.length === 0) return true;
-    return userKey.allowedModels.includes(model);
-  }
-}
-
-// ============ Token失败追踪器 ============
-class TokenFailureManager {
-  private failures = new Map<string, TokenFailureTracker>();
-
-  async loadFromKV(): Promise<void> {
-    if (!kv) return;
-    try {
-      const result = await kv.get<Record<string, TokenFailureTracker>>(["tokenFailures"]);
-      if (result.value) {
-        this.failures = new Map(Object.entries(result.value));
-        console.log(`[TokenFailure] Loaded ${this.failures.size} failure records from KV`);
-      }
-    } catch (e) {
-      console.error("[TokenFailure] Failed to load:", e);
-    }
-  }
-
-  async saveToKV(): Promise<void> {
-    if (!kv) return;
-    try {
-      await kv.set(["tokenFailures"], Object.fromEntries(this.failures));
-    } catch (e) {
-      console.error("[TokenFailure] Failed to save:", e);
-    }
-  }
-
-  async recordFailure(token: string): Promise<number> {
-    const maskedToken = mask(token);
-    const tracker = this.failures.get(maskedToken) || {
-      token: maskedToken,
-      failures: 0,
-      lastFailureAt: 0
-    };
-    tracker.failures++;
-    tracker.lastFailureAt = Date.now();
-    this.failures.set(maskedToken, tracker);
-    await this.saveToKV();
-    return tracker.failures;
-  }
-
-  async resetFailures(token: string): Promise<void> {
-    this.failures.delete(mask(token));
-    await this.saveToKV();
-  }
-
-  getFailureCount(token: string): number {
-    return this.failures.get(mask(token))?.failures ?? 0;
-  }
-
-  getAllFailures(): TokenFailureTracker[] {
-    return Array.from(this.failures.values());
-  }
-}
-
-const userKeyManager = new UserKeyManager();
-const tokenFailureManager = new TokenFailureManager();
-
+// ============ 会话管理系统（长上下文支持） ============
 interface Session {
   sessionId: string;
   messages: Array<{ role: string; content: string; timestamp: number }>;
   createdAt: number;
   lastAccessedAt: number;
-  kbList?: string[];  
+  kbList?: string[];  // 保存 kb_list UUID v4 数组，连续对话时复用
   metadata?: Record<string, any>;
 }
 
@@ -446,19 +288,27 @@ class SessionManager {
     if (!session) {
       session = await this.createSession(sessionId);
     }
+
     session.messages.push({ role, content, timestamp: Date.now() });
+
+    // 保持最大消息数限制
     if (session.messages.length > CONFIG.maxContextMessages) {
       session.messages = session.messages.slice(-CONFIG.maxContextMessages);
     }
+
+    // 更新或设置 kb_list（如果提供）
     if (kbList && kbList.length > 0) {
       session.kbList = kbList;
     }
+
     await this.saveSession(session);
   }
+
   async getKbList(sessionId: string): Promise<string[] | undefined> {
     const session = await this.getSession(sessionId);
     return session?.kbList;
   }
+
   async setKbList(sessionId: string, kbList: string[]): Promise<void> {
     let session = await this.getSession(sessionId);
     if (!session) {
@@ -467,6 +317,7 @@ class SessionManager {
     session.kbList = kbList;
     await this.saveSession(session);
   }
+
   async getContext(sessionId: string): Promise<Array<{ role: string; content: string }>> {
     const session = await this.getSession(sessionId);
     if (!session) return [];
@@ -507,6 +358,8 @@ if (CONFIG.enableLongContext) {
     );
   }, 300000);
 }
+
+// ============ MCP工具定义 ============
 interface MCPTool {
   type: "function";
   function: {
@@ -585,8 +438,6 @@ if (USE_KV && kv) {
   await loadTokensFromKV();  // 从KV加载已保存的tokens
   await syncTokensFromEnv(); // 同步环境变量中的tokens（差异或完全同步）
   await loadStatsFromKV();
-  await userKeyManager.loadFromKV(); // 加载用户密钥
-  await tokenFailureManager.loadFromKV(); // 加载失败记录
   await saveConfigToKV();  // 保存当前配置（如果KV中没有）
 } else {
   // 如果没有KV，也执行环境变量同步（只是不保存到KV）
@@ -1180,47 +1031,12 @@ serve(async (req:Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
   const reqId = genReqId(req.headers);
-  
-  // ============ 认证系统 ============
-  let userKey: string | null = null;
-  let isUserKeyAuth = false;
-  let isAdminAuth = false;
-  
-  // 如果启用了 SKIP_AUTH，跳过所有认证（仅用于本地测试）
-  if (CONFIG.skipAuth) {
-    isAdminAuth = true;
-    log.warn({ 事件:"跳过认证", 请求ID: reqId, 警告: "SKIP_AUTH已启用，请勿在生产环境使用！" });
-  } else {
-    // 获取提供的认证信息
+  if (API_KEYS.length > 0){
     const auth = req.headers.get("authorization") ?? "";
     const provided = auth.startsWith("Bearer ")? auth.slice(7) : "";
-    
-    if (CONFIG.isServer) {
-      // 服务器模式：使用用户密钥系统
-      if (provided) {
-        const userKeyObj = userKeyManager.getUserKey(provided);
-        if (userKeyObj) {
-          userKey = provided;
-          isUserKeyAuth = true;
-          isAdminAuth = userKeyObj.isAdmin;
-          await userKeyManager.incrementUsage(provided);
-        } else {
-          log.warn({ 事件:"用户密钥鉴权失败", 请求ID: reqId, 密钥: mask(provided) });
-          return unauthorized();
-        }
-      } else {
-        log.warn({ 事件:"缺少认证信息", 请求ID: reqId });
-        return unauthorized();
-      }
-    } else {
-      // 传统模式：使用API_KEYS
-      if (API_KEYS.length > 0){
-        if (!provided || !API_KEYS.includes(provided)){
-          log.warn({ 事件:"鉴权失败", 请求ID: reqId });
-          return unauthorized();
-        }
-        isAdminAuth = true; // 传统模式下所有API_KEYS都是管理员
-      }
+    if (!provided || !API_KEYS.includes(provided)){
+      log.warn({ 事件:"鉴权失败", 请求ID: reqId });
+      return unauthorized();
     }
   }
 
@@ -1240,40 +1056,10 @@ serve(async (req:Request): Promise<Response> => {
   });
 
   try{
-    /* 管理员面板 */
-    /* 静态文件服务 */
-    if (req.method==="GET" && path==="/admin.js") {
-      // 返回管理面板JavaScript文件
-      try {
-        const jsContent = await Deno.readTextFile(new URL("./admin.js", import.meta.url));
-        return new Response(jsContent, {
-          headers: { "content-type": "application/javascript; charset=utf-8" }
-        });
-      } catch (err) {
-        log.error({ 事件: "读取admin.js失败", 错误: String(err) });
-        return new Response("File not found", { status: 404 });
-      }
-    }
-    
-    if (req.method==="GET" && (path==="/admin" || path==="/admin/")) {
-      // 返回管理面板HTML文件
-      try {
-        const htmlContent = await Deno.readTextFile(new URL("./admin.html", import.meta.url));
-        return new Response(htmlContent, {
-          headers: { "content-type": "text/html; charset=utf-8" }
-        });
-      } catch (err) {
-        log.error({ 事件: "读取admin.html失败", 错误: String(err) });
-        return new Response("Admin panel not found", { status: 404 });
-      }
-    }
-    
-    /* API 端点 */
     /* 健康检查与状态 */
     if (req.method==="GET" && (path==="/__healthz" || path==="/healthz")) {
       return jsonResponse({ ok:true });
     }
-    
     if (req.method==="GET" && path==="/v1/status"){
       return jsonResponse({
         status:"ok",
@@ -1316,7 +1102,7 @@ serve(async (req:Request): Promise<Response> => {
 
     /* Token批量管理API - 需要管理员权限 */
     if (path==="/v1/admin/tokens/batch"){
-      if (!isAdminAuth) {
+      if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
@@ -1415,7 +1201,7 @@ serve(async (req:Request): Promise<Response> => {
     
     /* 清空所有tokens - 需要管理员权限 */
     if (path==="/v1/admin/tokens/clear"){
-      if (!isAdminAuth) {
+      if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
@@ -1431,7 +1217,7 @@ serve(async (req:Request): Promise<Response> => {
 
     /* Token管理API - 需要管理员权限 */
     if (path==="/v1/admin/tokens"){
-      if (!isAdminAuth) {
+      if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
@@ -1507,7 +1293,7 @@ serve(async (req:Request): Promise<Response> => {
 
     /* 重置统计信息 - 需要管理员权限 */
     if (req.method==="POST" && path==="/v1/admin/stats/reset"){
-      if (!isAdminAuth) {
+      if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
@@ -1532,7 +1318,7 @@ serve(async (req:Request): Promise<Response> => {
 
     /* 会话管理API - 需要管理员权限 */
     if (path==="/v1/admin/sessions"){
-      if (!isAdminAuth) {
+      if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
@@ -1571,131 +1357,6 @@ serve(async (req:Request): Promise<Response> => {
         await sessionManager.clearSession(sessionId);
         log.info({ 事件:"删除会话", 请求ID:reqId, sessionId });
         return jsonResponse({ success: true, message: "Session deleted successfully" });
-      }
-      
-      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
-    }
-
-    /* 用户密钥管理API - 需要管理员权限 */
-    if (path==="/v1/admin/user-keys"){
-      if (!isAdminAuth) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-      
-      // GET: 列出所有用户密钥
-      if (req.method==="GET"){
-        const userKeys = userKeyManager.getAllUserKeys();
-        log.info({ 事件:"列出用户密钥", 请求ID:reqId, 数量: userKeys.length });
-        return jsonResponse({
-          success: true,
-          user_keys: userKeys.map(uk => ({
-            key: mask(uk.key),
-            name: uk.name,
-            allowed_models: uk.allowedModels,
-            is_admin: uk.isAdmin,
-            usage_count: uk.usageCount,
-            created_at: new Date(uk.createdAt).toISOString(),
-            last_used_at: uk.lastUsedAt ? new Date(uk.lastUsedAt).toISOString() : null
-          })),
-          count: userKeys.length
-        });
-      }
-      
-      // POST: 添加用户密钥
-      if (req.method==="POST"){
-        let body:any = {};
-        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-        const { key, name, allowed_models, is_admin } = body;
-        if (!key || typeof key !== "string") return badRequest("`key` is required and must be a string.");
-        
-        const result = await userKeyManager.addUserKey(
-          key, 
-          name, 
-          allowed_models, 
-          is_admin ?? false
-        );
-        log.info({ 事件:"添加用户密钥", 请求ID:reqId, 成功: result.success, 消息: result.message });
-        return jsonResponse(result, result.success ? 200 : 400);
-      }
-      
-      // DELETE: 删除用户密钥
-      if (req.method==="DELETE"){
-        let body:any = {};
-        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-        const { key } = body;
-        if (!key || typeof key !== "string") return badRequest("`key` is required and must be a string.");
-        
-        const result = await userKeyManager.removeUserKey(key);
-        log.info({ 事件:"删除用户密钥", 请求ID:reqId, 成功: result.success, 消息: result.message });
-        return jsonResponse(result, result.success ? 200 : 404);
-      }
-      
-      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
-    }
-
-    /* 导出所有密钥 - 需要管理员权限 */
-    if (path==="/v1/admin/export-keys"){
-      if (!isAdminAuth) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-      
-      if (req.method==="GET"){
-        const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
-        const envTokens = envTokensStr.split(",").map(s => s.trim()).filter(Boolean);
-        
-        log.info({ 事件:"导出密钥", 请求ID:reqId, KV数量: TOKENS.length, 环境变量数量: envTokens.length });
-        return jsonResponse({
-          success: true,
-          upstream_tokens: {
-            kv_tokens: TOKENS,
-            env_tokens: envTokens,
-            total_unique: Array.from(new Set([...TOKENS, ...envTokens])).length
-          },
-          user_keys: userKeyManager.getAllUserKeys().map(uk => ({
-            key: uk.key,
-            name: uk.name,
-            allowed_models: uk.allowedModels,
-            is_admin: uk.isAdmin
-          }))
-        });
-      }
-      
-      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
-    }
-
-    /* Token失败记录API - 需要管理员权限 */
-    if (path==="/v1/admin/token-failures"){
-      if (!isAdminAuth) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-      
-      // GET: 查看所有失败记录
-      if (req.method==="GET"){
-        const failures = tokenFailureManager.getAllFailures();
-        return jsonResponse({
-          success: true,
-          failures: failures.map(f => ({
-            token: f.token,
-            failures: f.failures,
-            last_failure_at: new Date(f.lastFailureAt).toISOString()
-          })),
-          count: failures.length
-        });
-      }
-      
-      // POST: 重置指定token的失败记录
-      if (req.method==="POST"){
-        let body:any = {};
-        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-        const { token } = body;
-        if (!token || typeof token !== "string") return badRequest("`token` is required and must be a string.");
-        
-        await tokenFailureManager.resetFailures(token);
-        log.info({ 事件:"重置token失败记录", 请求ID:reqId, token: mask(token) });
-        return jsonResponse({ success: true, message: "Failure record reset successfully" });
       }
       
       return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
@@ -1781,14 +1442,6 @@ serve(async (req:Request): Promise<Response> => {
       const { model, messages, stream=false, kb_list, max_tokens, max_completion_tokens, session_id, tools, tool_choice } = body ?? {};
       if (!Array.isArray(messages) || messages.length===0) return badRequest("`messages` is required and must be a non-empty array.");
       if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
-      
-      // 检查用户密钥的模型限制
-      if (CONFIG.isServer && userKey && model) {
-        if (!userKeyManager.isModelAllowed(userKey, model)) {
-          log.warn({ 事件:"模型访问被拒绝", 请求ID:reqId, 用户密钥: mask(userKey), 模型: model });
-          return forbidden();
-        }
-      }
 
       let normMessages = normalizeMessages(messages);
       let finalKbList: string[];
@@ -2043,7 +1696,6 @@ serve(async (req:Request): Promise<Response> => {
             // 检查是否需要重试
             let shouldRetry = false;
             let retryReason = "";
-            let isTokenError = false;
             
             // 1. 检查 SSE 空返回或截断
             if ((isEmpty || isTruncated) && SSE_RETRY_ON_EMPTY && attempt < RETRY_MAX) {
@@ -2055,33 +1707,6 @@ serve(async (req:Request): Promise<Response> => {
             if (!shouldRetry && status >= 400 && RETRY_ON_STATUS.has(status) && attempt < RETRY_MAX) {
               shouldRetry = true;
               retryReason = `上游返回错误状态 ${status}`;
-              // 401, 402, 403 通常是token问题
-              if ([401, 402, 403].includes(status)) {
-                isTokenError = true;
-              }
-            }
-            
-            // 记录token失败
-            if (isTokenError && CONFIG.autoRemoveFailedTokens) {
-              const failureCount = await tokenFailureManager.recordFailure(picked.token);
-              log.warn({ 
-                事件:"记录token失败", 
-                失败次数: failureCount,
-                状态码: status,
-                ...logCtx 
-              });
-              
-              // 达到失败阈值，自动删除token
-              if (failureCount >= CONFIG.maxTokenFailures) {
-                await removeToken(picked.token);
-                log.error({ 
-                  事件:"自动删除失败token", 
-                  失败次数: failureCount,
-                  原因: `连续失败${failureCount}次`,
-                  剩余tokens: TOKENS.length,
-                  ...logCtx 
-                });
-              }
             }
             
             if (shouldRetry) {
@@ -2115,11 +1740,6 @@ serve(async (req:Request): Promise<Response> => {
               if (status >= 200 && status < 300 && !isEmpty) {
                 stats.successRequests++;
                 await saveStatsToKV(); // 成功时保存统计
-                
-                // 成功时重置token失败计数
-                if (CONFIG.autoRemoveFailedTokens) {
-                  await tokenFailureManager.resetFailures(picked.token);
-                }
                 
                 // 保存助手回复到会话
                 if (CONFIG.enableLongContext && session_id && content) {
@@ -2201,11 +1821,14 @@ serve(async (req:Request): Promise<Response> => {
       if (lastErr) {
         return gatewayError(lastErr);
       }
+      
       if (lastStatus && lastContent) {
+        // 尝试透传上游的原始错误响应
         let errorBody;
         try {
           errorBody = JSON.parse(lastContent);
         } catch {
+          // 解析失败，包装为标准错误格式
           errorBody = {
             error: {
               message: lastContent.slice(0, 500),
@@ -2214,6 +1837,7 @@ serve(async (req:Request): Promise<Response> => {
             }
           };
         }
+        
         return new Response(
           JSON.stringify(errorBody),
           { 
@@ -2227,6 +1851,7 @@ serve(async (req:Request): Promise<Response> => {
           }
         );
       }
+      
       if (lastStatus) {
         return jsonResponse({ 
           error:{ 
@@ -2240,326 +1865,8 @@ serve(async (req:Request): Promise<Response> => {
           "x-all-retries-failed": "true"
         });
       }
+      
       return gatewayTimeout("REQUEST_TIMED_OUT");
-    }
-
-    /* Claude Code 格式 API - /v1/messages */
-    if (req.method==="POST" && path==="/v1/messages"){
-      let body:any = {}; try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-      const { model, messages, stream=false, max_tokens, system } = body ?? {};
-      if (!Array.isArray(messages) || messages.length===0) return badRequest("`messages` is required and must be a non-empty array.");
-      if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured", type:"authentication_error" }}, 429);
-      
-      // 检查用户密钥的模型限制
-      if (CONFIG.isServer && userKey && model) {
-        if (!userKeyManager.isModelAllowed(userKey, model)) {
-          log.warn({ 事件:"模型访问被拒绝(Claude)", 请求ID:reqId, 用户密钥: mask(userKey), 模型: model });
-          return jsonResponse({ 
-            error:{ message:"Model access denied", type:"permission_error" }
-          }, 403);
-        }
-      }
-      
-      // 转换 Claude 格式到 OpenAI 格式
-      let normMessages = normalizeMessages(messages);
-      
-      // 如果有 system 消息，添加到开头
-      if (system && typeof system === "string") {
-        normMessages.unshift({ role: "system", content: system });
-      }
-      
-      // 生成 kb_list (Claude 不需要这个，但上游需要)
-      const finalKbList = [crypto.randomUUID()];
-      
-      const modelName = model ?? "claude-3-5-sonnet-20241022";
-      const isExternalStream = !!stream;
-      
-      const upstreamBody:any = {
-        messages: normMessages,
-        kb_list: finalKbList,
-        stream: isExternalStream,
-        model: modelName,
-        ...(Number.isFinite(max_tokens)? { max_tokens }:{})
-      };
-      
-      log.info({ 
-        事件:"Claude API请求", 
-        模型: modelName, 
-        消息数: normMessages.length,
-        最大tokens: max_tokens,
-        流式: isExternalStream,
-        ...{ 请求ID: reqId }
-      });
-      
-      let attempt = 0, lastErr:any=null, lastStatus=0, lastContent="", lastHeaders:Headers|null=null;
-      let needsRetry = false;
-      let lastTokenIdx = -1;
-      
-      while (attempt <= RETRY_MAX) {
-        const picked = nextToken();
-        if (!picked) break;
-        
-        const isKeySwitch = lastTokenIdx !== -1 && lastTokenIdx !== picked.idx;
-        lastTokenIdx = picked.idx;
-        
-        const logCtx = { 
-          请求ID:reqId, 
-          模型:modelName, 
-          token: mask(picked.token), 
-          token索引: picked.idx,
-          尝试:attempt+1, 
-          外部流:isExternalStream 
-        };
-        
-        needsRetry = false;
-        
-        try{
-          const result = await callUpstreamChat({
-            reqId, token:picked.token, body: upstreamBody,
-            forceStream: false, isExternalStream, modelName
-          });
-          
-          if (result.kind === "stream") {
-            // 流式响应 - 转换为 Claude 格式
-            const upstreamResp = result.resp;
-            const readable = new ReadableStream({
-              async start(controller){
-                const body = upstreamResp.body as ReadableStream<Uint8Array> | null;
-                if (!body) {
-                  controller.enqueue(enc.encode(`event: message_stop\ndata: {}\n\n`));
-                  controller.close(); 
-                  return;
-                }
-                const reader = body.getReader();
-                let buf = "";
-                let messageStarted = false;
-                
-                try{
-                  while (true){
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buf += dec.decode(value, { stream:true });
-
-                    let idx;
-                    while ((idx = buf.indexOf("\n\n")) !== -1){
-                      const evt = buf.slice(0, idx); buf = buf.slice(idx+2);
-                      const dataLines = evt.split("\n")
-                      .map(l => l.trimEnd())
-                      .filter(l => l.startsWith("data:"))
-                      .map(l => l.slice(5).trim());
-                      if (dataLines.length === 0) continue;
-
-                      const data = dataLines.join("\n");
-                      
-                      try{
-                        const obj = JSON.parse(data);
-                        const delta = typeof obj?.content === "string" ? obj.content : "";
-                        
-                        if (delta) {
-                          if (!messageStarted) {
-                            // 发送 message_start 事件
-                            controller.enqueue(enc.encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"${reqId}","type":"message","role":"assistant","content":[],"model":"${modelName}"}}\n\n`));
-                            controller.enqueue(enc.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
-                            messageStarted = true;
-                          }
-                          // 发送 content_block_delta
-                          controller.enqueue(enc.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${JSON.stringify(delta)}}}\n\n`));
-                        }
-                        
-                        if (obj?.tag === "final") {
-                          if (messageStarted) {
-                            controller.enqueue(enc.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-                          }
-                          controller.enqueue(enc.encode(`event: message_stop\ndata: {}\n\n`));
-                          controller.close();
-                          return;
-                        }
-                      }catch{
-                        const { delta, isFinal } = extractDeltaFromTextChunk(data);
-                        if (delta) {
-                          if (!messageStarted) {
-                            controller.enqueue(enc.encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"${reqId}","type":"message","role":"assistant","content":[],"model":"${modelName}"}}\n\n`));
-                            controller.enqueue(enc.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
-                            messageStarted = true;
-                          }
-                          controller.enqueue(enc.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${JSON.stringify(delta)}}}\n\n`));
-                        }
-                        if (isFinal) {
-                          if (messageStarted) {
-                            controller.enqueue(enc.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-                          }
-                          controller.enqueue(enc.encode(`event: message_stop\ndata: {}\n\n`));
-                          controller.close();
-                          return;
-                        }
-                      }
-                    }
-                  }
-                } catch (e) {
-                  log.warn({ 事件:"Claude流式读取异常", 错误:String((e as any)?.message ?? e), ...logCtx });
-                } finally {
-                  if (messageStarted) {
-                    controller.enqueue(enc.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-                  }
-                  controller.enqueue(enc.encode(`event: message_stop\ndata: {}\n\n`));
-                  try { controller.close(); } catch {}
-                }
-              }
-            });
-
-            stats.successRequests++;
-            await saveStatsToKV();
-            return new Response(readable, {
-              headers:{
-                "content-type":"text/event-stream",
-                "cache-control":"no-cache, no-transform",
-                "connection":"keep-alive",
-                "x-request-id": reqId
-              }
-            });
-          } else {
-            // 非流式响应 - 转换为 Claude 格式
-            const { status, content, headers, isEmpty, isTruncated } = result;
-            
-            let shouldRetry = false;
-            let retryReason = "";
-            let isTokenError = false;
-            
-            if ((isEmpty || isTruncated) && SSE_RETRY_ON_EMPTY && attempt < RETRY_MAX) {
-              shouldRetry = true;
-              retryReason = isEmpty ? "返回为空" : "数据截断";
-            }
-            
-            if (!shouldRetry && status >= 400 && RETRY_ON_STATUS.has(status) && attempt < RETRY_MAX) {
-              shouldRetry = true;
-              retryReason = `上游返回错误状态 ${status}`;
-              if ([401, 402, 403].includes(status)) {
-                isTokenError = true;
-              }
-            }
-            
-            if (isTokenError && CONFIG.autoRemoveFailedTokens) {
-              const failureCount = await tokenFailureManager.recordFailure(picked.token);
-              if (failureCount >= CONFIG.maxTokenFailures) {
-                await removeToken(picked.token);
-                log.error({ 
-                  事件:"自动删除失败token(Claude)", 
-                  失败次数: failureCount,
-                  ...logCtx 
-                });
-              }
-            }
-            
-            if (shouldRetry) {
-              needsRetry = true;
-              lastContent = content;
-              lastStatus = status;
-              lastHeaders = headers;
-            } else {
-              if (status >= 200 && status < 300 && !isEmpty) {
-                stats.successRequests++;
-                await saveStatsToKV();
-                
-                if (CONFIG.autoRemoveFailedTokens) {
-                  await tokenFailureManager.resetFailures(picked.token);
-                }
-                
-                // 返回 Claude 格式
-                const claudeResponse = {
-                  id: reqId,
-                  type: "message",
-                  role: "assistant",
-                  content: [{ type: "text", text: content }],
-                  model: modelName,
-                  stop_reason: "end_turn",
-                  stop_sequence: null,
-                  usage: {
-                    input_tokens: 0,
-                    output_tokens: 0
-                  }
-                };
-                
-                return new Response(
-                  JSON.stringify(claudeResponse),
-                  { status: 200, headers: { 
-                    "content-type":"application/json", 
-                    "x-request-id": reqId
-                  }}
-                );
-              } else {
-                stats.failedRequests++;
-                await saveStatsToKV();
-                
-                // 返回 Claude 格式错误
-                let errorResponse;
-                try {
-                  const parsed = JSON.parse(content);
-                  errorResponse = {
-                    type: "error",
-                    error: {
-                      type: status === 401 ? "authentication_error" : status === 403 ? "permission_error" : "api_error",
-                      message: parsed.error?.message ?? content.slice(0, 500)
-                    }
-                  };
-                } catch {
-                  errorResponse = {
-                    type: "error",
-                    error: {
-                      type: "api_error",
-                      message: content.slice(0, 500) || `HTTP ${status}`
-                    }
-                  };
-                }
-                
-                return new Response(
-                  JSON.stringify(errorResponse),
-                  { status, headers: { 
-                    "content-type":"application/json", 
-                    "x-request-id": reqId
-                  }}
-                );
-              }
-            }
-          }
-        } catch (e) {
-          lastErr = e;
-          needsRetry = true;
-          log.warn({ 
-            事件:"Claude调用异常", 
-            错误:String((e as any)?.message ?? e), 
-            ...logCtx 
-          });
-        }
-
-        if (!needsRetry) break;
-
-        attempt++;
-        if (attempt > RETRY_MAX) break;
-        
-        const backoffMs = RETRY_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
-        if (backoffMs > 0) await delay(backoffMs);
-      }
-
-      stats.failedRequests++;
-      await saveStatsToKV();
-      
-      if (lastErr) {
-        return jsonResponse({ 
-          type: "error",
-          error: {
-            type: "api_error",
-            message: String((lastErr as any)?.message ?? lastErr)
-          }
-        }, 502);
-      }
-      
-      return jsonResponse({ 
-        type: "error",
-        error: {
-          type: "api_error",
-          message: lastContent || "Request timeout"
-        }
-      }, lastStatus || 504);
     }
 
     stats.failedRequests++;
