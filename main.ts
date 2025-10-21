@@ -1,20 +1,175 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { DB } from "https://deno.land/x/sqlite/mod.ts";
 
-// ============ Deno KV 配置 ============
-const USE_KV = (Deno.env.get("USE_DENO_KV") ?? "true").toLowerCase() === "true";
-const KV_PATH = Deno.env.get("DENO_KV_PATH"); // 可选：自定义 KV 数据库路径
-let kv: Deno.Kv | null = null;
+// ============ 存储抽象层 ============
+interface StorageAdapter {
+  get<T>(key: string[]): Promise<T | null>;
+  set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void>;
+  delete(key: string[]): Promise<void>;
+  close(): Promise<void>;
+}
 
-// 初始化 Deno KV
-if (USE_KV) {
-  try {
-    kv = await Deno.openKv(KV_PATH);
-    console.log(`[KV] Deno KV initialized${KV_PATH ? ` at ${KV_PATH}` : ""}`);
+// SQLite 存储适配器
+class SQLiteAdapter implements StorageAdapter {
+  private db: DB;
+  
+  constructor(path: string) {
+    this.db = new DB(path);
+    this.db.execute(`
+      CREATE TABLE IF NOT EXISTS kv_store (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        expire_at INTEGER
+      )
+    `);
+    this.db.execute(`CREATE INDEX IF NOT EXISTS idx_expire ON kv_store(expire_at)`);
+    // 定期清理过期数据
+    setInterval(() => this.cleanup(), 60000);
+  }
+  
+  private cleanup() {
+    try {
+      const now = Date.now();
+      this.db.query("DELETE FROM kv_store WHERE expire_at IS NOT NULL AND expire_at < ?", [now]);
   } catch (e) {
-    console.error("[KV] Failed to initialize Deno KV:", e);
-    console.log("[KV] Falling back to in-memory storage");
+      console.error("[SQLite] Cleanup error:", e);
+    }
+  }
+  
+  async get<T>(key: string[]): Promise<T | null> {
+    const keyStr = JSON.stringify(key);
+    const now = Date.now();
+    const rows = this.db.query("SELECT value FROM kv_store WHERE key = ? AND (expire_at IS NULL OR expire_at > ?)", [keyStr, now]);
+    
+    if (rows.length === 0) return null;
+    
+    try {
+      return JSON.parse(rows[0][0] as string) as T;
+    } catch {
+      return null;
+    }
+  }
+  
+  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
+    const keyStr = JSON.stringify(key);
+    const valueStr = JSON.stringify(value);
+    const expireAt = options?.expireIn ? Date.now() + options.expireIn : null;
+    
+    this.db.query(
+      "INSERT OR REPLACE INTO kv_store (key, value, expire_at) VALUES (?, ?, ?)",
+      [keyStr, valueStr, expireAt]
+    );
+  }
+  
+  async delete(key: string[]): Promise<void> {
+    const keyStr = JSON.stringify(key);
+    this.db.query("DELETE FROM kv_store WHERE key = ?", [keyStr]);
+  }
+  
+  async close(): Promise<void> {
+    this.db.close();
   }
 }
+
+// Deno KV 存储适配器
+class DenoKVAdapter implements StorageAdapter {
+  constructor(private kv: Deno.Kv) {}
+  
+  async get<T>(key: string[]): Promise<T | null> {
+    const result = await this.kv.get<T>(key);
+    return result.value;
+  }
+  
+  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
+    await this.kv.set(key, value, options);
+  }
+  
+  async delete(key: string[]): Promise<void> {
+    await this.kv.delete(key);
+  }
+  
+  async close(): Promise<void> {
+    this.kv.close();
+  }
+}
+
+// 内存存储适配器
+class MemoryAdapter implements StorageAdapter {
+  private store = new Map<string, { value: any; expireAt?: number }>();
+  
+  constructor() {
+    setInterval(() => this.cleanup(), 60000);
+  }
+  
+  private cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.store.entries()) {
+      if (entry.expireAt && entry.expireAt < now) {
+        this.store.delete(key);
+      }
+    }
+  }
+  
+  async get<T>(key: string[]): Promise<T | null> {
+    const keyStr = JSON.stringify(key);
+    const entry = this.store.get(keyStr);
+    
+    if (!entry) return null;
+    if (entry.expireAt && entry.expireAt < Date.now()) {
+      this.store.delete(keyStr);
+      return null;
+    }
+    
+    return entry.value as T;
+  }
+  
+  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
+    const keyStr = JSON.stringify(key);
+    const expireAt = options?.expireIn ? Date.now() + options.expireIn : undefined;
+    this.store.set(keyStr, { value, expireAt });
+  }
+  
+  async delete(key: string[]): Promise<void> {
+    const keyStr = JSON.stringify(key);
+    this.store.delete(keyStr);
+  }
+  
+  async close(): Promise<void> {
+    this.store.clear();
+  }
+}
+
+// ============ 存储初始化 ============
+const STORAGE_TYPE = (Deno.env.get("STORAGE_TYPE") ?? "kv").toLowerCase();
+let storage: StorageAdapter | null = null;
+let kv: Deno.Kv | null = null; // 保留向后兼容
+
+async function initStorage(): Promise<void> {
+  const kvPath = Deno.env.get("DENO_KV_PATH");
+  const sqlitePath = Deno.env.get("SQLITE_PATH") || "./data.db";
+  
+  try {
+    if (STORAGE_TYPE === "sqlite") {
+      storage = new SQLiteAdapter(sqlitePath);
+      console.log(`[Storage] SQLite initialized at ${sqlitePath}`);
+    } else if (STORAGE_TYPE === "memory") {
+      storage = new MemoryAdapter();
+      console.log("[Storage] Memory storage initialized");
+    } else {
+      // 默认使用 Deno KV
+      const denoKv = await Deno.openKv(kvPath);
+      kv = denoKv; // 保留向后兼容
+      storage = new DenoKVAdapter(denoKv);
+      console.log(`[Storage] Deno KV initialized${kvPath ? ` at ${kvPath}` : ""}`);
+    }
+  } catch (e) {
+    console.error("[Storage] Initialization failed:", e);
+    console.log("[Storage] Falling back to memory storage");
+    storage = new MemoryAdapter();
+  }
+}
+
+await initStorage();
 
 // ============ 配置管理系统 ============
 interface AppConfig {
@@ -50,6 +205,17 @@ interface AppConfig {
   // MCP配置
   enableMCP: boolean;
   mcpTools: string[];
+  // 存储配置
+  storageType: "kv" | "sqlite" | "memory";
+  sqlitePath?: string;
+  // 仅服务端模式
+  serverOnly: boolean;
+  // Claude API 兼容
+  enableClaudeAPI: boolean;
+  // 思考功能增强
+  enableThinkingTags: boolean;
+  // 性能优化
+  enableStreamOptimization: boolean;
 }
 
 // 从环境变量加载配置
@@ -59,6 +225,9 @@ function loadConfigFromEnv(): AppConfig {
   const origin = flowithBase
     ? flowithBase.replace(/\/+$/, "")
     : (flowithRegion ? `https://${flowithRegion}.edge.flowith.net` : `https://edge.flowith.net`);
+
+  const storageTypeEnv = (Deno.env.get("STORAGE_TYPE") ?? "kv").toLowerCase();
+  const storageType = (storageTypeEnv === "sqlite" || storageTypeEnv === "memory") ? storageTypeEnv : "kv";
 
   return {
     // tokens 不从这里加载，而是通过 syncTokensFromEnv() 统一管理
@@ -78,42 +247,48 @@ function loadConfigFromEnv(): AppConfig {
     retryBackoffBaseMs: Math.max(0, Number(Deno.env.get("UPSTREAM_RETRY_BACKOFF_MS") ?? "200")),
     sseRetryOnEmpty: (Deno.env.get("SSE_RETRY_ON_EMPTY") ?? "true").toLowerCase() === "true",
     sseMinContentLength: Math.max(0, Number(Deno.env.get("SSE_MIN_CONTENT_LENGTH") ?? "10")),
-    retryOnStatus: [401, 403, 408,402, 409, 425, 429, 500, 502, 503, 504],
+    retryOnStatus: [401, 403, 408, 402, 409, 425, 429, 500, 502, 503, 504],
     enableLongContext: (Deno.env.get("ENABLE_LONG_CONTEXT") ?? "true").toLowerCase() === "true",
     maxContextMessages: Math.max(1, Number(Deno.env.get("MAX_CONTEXT_MESSAGES") ?? "20")),
     contextTTLSeconds: Math.max(60, Number(Deno.env.get("CONTEXT_TTL_SECONDS") ?? "3600")),
     enableThinkingInjection: (Deno.env.get("ENABLE_THINKING_INJECTION") ?? "true").toLowerCase() === "true",
     thinkingPrompt: Deno.env.get("THINKING_PROMPT") ?? "Please think step by step before answering.",
     enableMCP: (Deno.env.get("ENABLE_MCP") ?? "true").toLowerCase() === "true",
-    mcpTools: (Deno.env.get("MCP_TOOLS") ?? "web_search,image_gen,code_interpreter").split(",").map(s => s.trim()).filter(Boolean)
+    mcpTools: (Deno.env.get("MCP_TOOLS") ?? "web_search,image_gen,code_interpreter").split(",").map(s => s.trim()).filter(Boolean),
+    storageType: storageType as "kv" | "sqlite" | "memory",
+    sqlitePath: Deno.env.get("SQLITE_PATH") || "./data.db",
+    serverOnly: (Deno.env.get("SERVER_ONLY") ?? "false").toLowerCase() === "true",
+    enableClaudeAPI: (Deno.env.get("ENABLE_CLAUDE_API") ?? "true").toLowerCase() === "true",
+    enableThinkingTags: (Deno.env.get("ENABLE_THINKING_TAGS") ?? "true").toLowerCase() === "true",
+    enableStreamOptimization: (Deno.env.get("ENABLE_STREAM_OPTIMIZATION") ?? "true").toLowerCase() === "true"
   };
 }
 
 // 全局配置对象
 let CONFIG = loadConfigFromEnv();
 
-// 保存配置到KV
-async function saveConfigToKV(): Promise<void> {
-  if (!kv) return;
+// 保存配置到存储
+async function saveConfigToStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    await kv.set(["config"], CONFIG);
-    console.log("[KV] Configuration saved to KV");
+    await storage.set(["config"], CONFIG);
+    console.log("[Storage] Configuration saved");
   } catch (e) {
-    console.error("[KV] Failed to save config:", e);
+    console.error("[Storage] Failed to save config:", e);
   }
 }
 
-// 从KV加载配置
-async function loadConfigFromKV(): Promise<void> {
-  if (!kv) return;
+// 从存储加载配置
+async function loadConfigFromStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    const result = await kv.get<AppConfig>(["config"]);
-    if (result.value) {
-      CONFIG = { ...CONFIG, ...result.value };
-      console.log("[KV] Configuration loaded from KV");
+    const value = await storage.get<AppConfig>(["config"]);
+    if (value) {
+      CONFIG = { ...CONFIG, ...value };
+      console.log("[Storage] Configuration loaded");
     }
   } catch (e) {
-    console.error("[KV] Failed to load config:", e);
+    console.error("[Storage] Failed to load config:", e);
   }
 }
 
@@ -148,58 +323,58 @@ const log = {
   warn :(o:any)=>logAt("warn",o),
   error:(o:any)=>logAt("error",o),
 };
-// ============ KV 数据操作函数 ============
-async function loadTokensFromKV(): Promise<void> {
-  if (!kv) return;
+// ============ 数据操作函数 ============
+async function loadTokensFromStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    const result = await kv.get<string[]>(["tokens"]);
-    if (result.value && Array.isArray(result.value)) {
+    const value = await storage.get<string[]>(["tokens"]);
+    if (value && Array.isArray(value)) {
       TOKENS.length = 0;
-      TOKENS.push(...result.value);
-      console.log(`[KV] Loaded ${TOKENS.length} tokens from KV`);
+      TOKENS.push(...value);
+      console.log(`[Storage] Loaded ${TOKENS.length} tokens`);
     }
   } catch (e) {
-    console.error("[KV] Failed to load tokens:", e);
+    console.error("[Storage] Failed to load tokens:", e);
   }
 }
 
-async function saveTokensToKV(): Promise<void> {
-  if (!kv) return;
+async function saveTokensToStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    await kv.set(["tokens"], TOKENS);
-    console.log(`[KV] Saved ${TOKENS.length} tokens to KV`);
+    await storage.set(["tokens"], TOKENS);
+    console.log(`[Storage] Saved ${TOKENS.length} tokens`);
   } catch (e) {
-    console.error("[KV] Failed to save tokens:", e);
+    console.error("[Storage] Failed to save tokens:", e);
   }
 }
 
-async function loadStatsFromKV(): Promise<void> {
-  if (!kv) return;
+async function loadStatsFromStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    const result = await kv.get<{
+    const value = await storage.get<{
       totalRequests: number;
       successRequests: number;
       failedRequests: number;
       tokenUsage: Record<string, number>;
       lastResetTime: number;
     }>(["stats"]);
-    if (result.value) {
-      stats.totalRequests = result.value.totalRequests ?? 0;
-      stats.successRequests = result.value.successRequests ?? 0;
-      stats.failedRequests = result.value.failedRequests ?? 0;
-      stats.tokenUsage = new Map(Object.entries(result.value.tokenUsage ?? {}));
-      stats.lastResetTime = result.value.lastResetTime ?? Date.now();
-      console.log(`[KV] Loaded stats from KV: ${stats.totalRequests} total requests`);
+    if (value) {
+      stats.totalRequests = value.totalRequests ?? 0;
+      stats.successRequests = value.successRequests ?? 0;
+      stats.failedRequests = value.failedRequests ?? 0;
+      stats.tokenUsage = new Map(Object.entries(value.tokenUsage ?? {}));
+      stats.lastResetTime = value.lastResetTime ?? Date.now();
+      console.log(`[Storage] Loaded stats: ${stats.totalRequests} total requests`);
     }
   } catch (e) {
-    console.error("[KV] Failed to load stats:", e);
+    console.error("[Storage] Failed to load stats:", e);
   }
 }
 
-async function saveStatsToKV(): Promise<void> {
-  if (!kv) return;
+async function saveStatsToStorage(): Promise<void> {
+  if (!storage) return;
   try {
-    await kv.set(["stats"], {
+    await storage.set(["stats"], {
       totalRequests: stats.totalRequests,
       successRequests: stats.successRequests,
       failedRequests: stats.failedRequests,
@@ -207,7 +382,7 @@ async function saveStatsToKV(): Promise<void> {
       lastResetTime: stats.lastResetTime
     });
   } catch (e) {
-    console.error("[KV] Failed to save stats:", e);
+    console.error("[Storage] Failed to save stats:", e);
   }
 }
 
@@ -220,7 +395,6 @@ const stats = {
   lastResetTime: Date.now()
 };
 
-// ============ 会话管理系统（长上下文支持） ============
 interface Session {
   sessionId: string;
   messages: Array<{ role: string; content: string; timestamp: number }>;
@@ -228,6 +402,14 @@ interface Session {
   lastAccessedAt: number;
   kbList?: string[];  // 保存 kb_list UUID v4 数组，连续对话时复用
   metadata?: Record<string, any>;
+  apiKey?: string;    // 关联的 API key（用于自动会话）
+  model?: string;     // 关联的模型（用于自动会话）
+}
+
+// 生成自动会话 ID（基于 API key + 模型）
+function generateAutoSessionId(apiKey: string, model: string): string {
+  const key = `auto_${apiKey}_${model}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return key.substring(0, 100); // 限制长度
 }
 
 class SessionManager {
@@ -241,12 +423,11 @@ class SessionManager {
       return session;
     }
 
-    // 从KV加载
-    if (kv) {
+    if (storage) {
       try {
-        const result = await kv.get<Session>(["sessions", sessionId]);
-        if (result.value) {
-          session = result.value;
+        const value = await storage.get<Session>(["sessions", sessionId]);
+        if (value) {
+          session = value;
           session.lastAccessedAt = Date.now();
           this.sessions.set(sessionId, session);
           return session;
@@ -272,9 +453,9 @@ class SessionManager {
   }
 
   async saveSession(session: Session): Promise<void> {
-    if (kv) {
+    if (storage) {
       try {
-        await kv.set(["sessions", session.sessionId], session, {
+        await storage.set(["sessions", session.sessionId], session, {
           expireIn: CONFIG.contextTTLSeconds * 1000
         });
       } catch (e) {
@@ -326,9 +507,9 @@ class SessionManager {
 
   async clearSession(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
-    if (kv) {
+    if (storage) {
       try {
-        await kv.delete(["sessions", sessionId]);
+        await storage.delete(["sessions", sessionId]);
       } catch (e) {
         log.error({ 事件: "会话删除失败", sessionId, 错误: String(e) });
       }
@@ -432,29 +613,29 @@ const MCP_TOOLS: MCPTool[] = [
   }
 ];
 
-// 从 KV 加载初始数据
-if (USE_KV && kv) {
-  await loadConfigFromKV();  // 先加载配置
-  await loadTokensFromKV();  // 从KV加载已保存的tokens
+// 加载初始数据
+if (storage) {
+  await loadConfigFromStorage();  // 先加载配置
+  await loadTokensFromStorage();  // 从存储加载已保存的tokens
   await syncTokensFromEnv(); // 同步环境变量中的tokens（差异或完全同步）
-  await loadStatsFromKV();
-  await saveConfigToKV();  // 保存当前配置（如果KV中没有）
+  await loadStatsFromStorage();
+  await saveConfigToStorage();  // 保存当前配置（如果存储中没有）
 } else {
-  // 如果没有KV，也执行环境变量同步（只是不保存到KV）
+  // 如果没有存储，也执行环境变量同步（只是不保存）
   const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
   const envTokens = Array.from(new Set(
     envTokensStr.split(",").map(s => s.trim()).filter(Boolean)
   ));
   if (envTokens.length > 0 && TOKENS.length === 0) {
     TOKENS.push(...envTokens);
-    console.log(`[Sync] Loaded ${TOKENS.length} tokens from environment (no KV)`);
+    console.log(`[Sync] Loaded ${TOKENS.length} tokens from environment (no storage)`);
   }
 }
 
-// 定期保存统计数据到 KV（每30秒）
-if (USE_KV && kv) {
+// 定期保存统计数据（每30秒）
+if (storage) {
   setInterval(() => {
-    saveStatsToKV().catch(e => console.error("[KV] Auto-save stats failed:", e));
+    saveStatsToStorage().catch(e => console.error("[Storage] Auto-save stats failed:", e));
   }, 30000);
 }
 const mask = (s?:string|null)=>!s?"":(s.length<=8?"***":`${s.slice(0,4)}...${s.slice(-4)}`);
@@ -551,7 +732,7 @@ async function addToken(token:string): Promise<{ success:boolean, message:string
   if (!trimmed) return { success:false, message:"Token cannot be empty" };
   if (TOKENS.includes(trimmed)) return { success:false, message:"Token already exists" };
   TOKENS.push(trimmed);
-  await saveTokensToKV();
+  await saveTokensToStorage();
   return { success:true, message:"Token added successfully" };
 }
 async function removeToken(token:string): Promise<{ success:boolean, message:string }> {
@@ -559,7 +740,7 @@ async function removeToken(token:string): Promise<{ success:boolean, message:str
   const idx = TOKENS.indexOf(trimmed);
   if (idx === -1) return { success:false, message:"Token not found" };
   TOKENS.splice(idx, 1);
-  await saveTokensToKV();
+  await saveTokensToStorage();
   return { success:true, message:"Token removed successfully" };
 }
 async function addTokensBatch(tokens: string[]): Promise<{ success:boolean, message:string, added:number, skipped:number, failed:string[] }> {
@@ -582,7 +763,19 @@ async function addTokensBatch(tokens: string[]): Promise<{ success:boolean, mess
   }
   
   if (added > 0) {
-    await saveTokensToKV();
+    try {
+      await saveTokensToStorage();
+    } catch (e) {
+      // 如果保存失败，回滚已添加的tokens
+      TOKENS.splice(-added);
+      return {
+        success: false,
+        message: `Failed to save tokens: ${String(e)}`,
+        added: 0,
+        skipped,
+        failed: [...failed, ...tokens.slice(-added).map(t => `${t} (rollback)`)]
+      };
+    }
   }
   
   return {
@@ -611,7 +804,7 @@ async function removeTokensBatch(tokens: string[]): Promise<{ success:boolean, m
   }
   
   if (removed > 0) {
-    await saveTokensToKV();
+    await saveTokensToStorage();
   }
   
   return {
@@ -624,7 +817,7 @@ async function removeTokensBatch(tokens: string[]): Promise<{ success:boolean, m
 async function clearAllTokens(): Promise<{ success:boolean, message:string, cleared:number }> {
   const count = TOKENS.length;
   TOKENS.length = 0;
-  await saveTokensToKV();
+  await saveTokensToStorage();
   return {
     success: true,
     message: `Cleared ${count} tokens`,
@@ -632,7 +825,7 @@ async function clearAllTokens(): Promise<{ success:boolean, message:string, clea
   };
 }
 
-// 启动时同步环境变量中的tokens到KV
+// 启动时同步环境变量中的tokens
 async function syncTokensFromEnv(): Promise<void> {
   const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
   const envTokens = Array.from(new Set(
@@ -647,14 +840,14 @@ async function syncTokensFromEnv(): Promise<void> {
   }
   
   if (rsyncMode) {
-    // 完全同步模式：清空KV，完全替换
+    // 完全同步模式：清空存储，完全替换
     console.log(`[Sync] RSYNC mode enabled: clearing all tokens and loading ${envTokens.length} tokens from environment`);
     TOKENS.length = 0;
     TOKENS.push(...envTokens);
-    await saveTokensToKV();
+    await saveTokensToStorage();
     console.log(`[Sync] Full sync completed: ${TOKENS.length} tokens loaded`);
   } else {
-    // 差异同步模式：只添加新的token，保留KV中已有的
+    // 差异同步模式：只添加新的token，保留存储中已有的
     const existingSet = new Set(TOKENS);
     const newTokens: string[] = [];
     
@@ -666,7 +859,7 @@ async function syncTokensFromEnv(): Promise<void> {
     }
     
     if (newTokens.length > 0) {
-      await saveTokensToKV();
+      await saveTokensToStorage();
       console.log(`[Sync] Differential sync completed: added ${newTokens.length} new tokens, total ${TOKENS.length} tokens`);
     } else {
       console.log(`[Sync] Differential sync completed: no new tokens to add, total ${TOKENS.length} tokens`);
@@ -898,17 +1091,42 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
         const data = dataLines.join("\n");
         log.debug({ 事件:"上游SSE分片(聚合)", 原文预览: data.slice(0, 200), 块序号: chunkCount, ...logCtx });
 
+        // 检查是否为 [DONE] 标记（非JSON格式）
+        if (data === "[DONE]") {
+          log.debug({ 事件:"收到[DONE]标记", ...logCtx });
+          readerClosed = true;
+          break;
+        }
+
         try {
           const obj = JSON.parse(data);
-          const delta = typeof obj?.content === "string"
-          ? obj.content
-          : (obj?.tag === "final" ? String(obj.content ?? "") : "");
+          // Flowith格式：每个chunk都有tag:final，只有content为"[DONE]"时才真正结束
+          if (obj?.tag === "seeds") {
+            // seeds标记，跳过
+            log.debug({ 事件:"收到seeds标记", 内容: obj.content, ...logCtx });
+            continue;
+          }
+          
+          if (obj?.tag === "final") {
+            const delta = typeof obj?.content === "string" ? obj.content : String(obj.content ?? "");
+            // 检查是否为结束标记
+            if (delta === "[DONE]") {
+              log.debug({ 事件:"收到final+[DONE]标记", ...logCtx });
+              readerClosed = true;
+              break;
+            }
+            // 正常内容，累加
           if (delta) content += delta;
-          if (obj?.tag === "final") { readerClosed = true; break; }
+          } else {
+            // 其他格式兼容
+            const delta = typeof obj?.content === "string" ? obj.content : "";
+            if (delta) content += delta;
+          }
         } catch {
+          // JSON解析失败，尝试提取文本
           const { delta, isFinal } = extractDeltaFromTextChunk(data);
-          if (delta) content += delta;
-          if (isFinal) { readerClosed = true; break; }
+          if (delta && delta !== "[DONE]") content += delta;
+          if (isFinal || delta === "[DONE]") { readerClosed = true; break; }
         }
       }
     }
@@ -974,7 +1192,10 @@ async function callUpstreamChat(opts: {
   const status = resp.status;
   const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
 
+  // 对于外部流式请求，无论上游返回什么content-type都需要转换为标准SSE格式
+  // 因为上游可能返回 text/plain，需要统一处理
   if (isExternalStream && upstreamStream) {
+    // 不再直接透传，而是进行格式转换
     return { kind:"stream", resp };
   }
 
@@ -1031,12 +1252,39 @@ serve(async (req:Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
   const reqId = genReqId(req.headers);
-  if (API_KEYS.length > 0){
+  
+  // 仅服务端模式：跳过API_KEYS鉴权，直接透传下游的Authorization
+  const serverOnlyMode = CONFIG.serverOnly;
+  let downstreamToken: string | null = null;
+  
+  if (serverOnlyMode) {
+    // 提取下游传来的token用于透传
     const auth = req.headers.get("authorization") ?? "";
-    const provided = auth.startsWith("Bearer ")? auth.slice(7) : "";
-    if (!provided || !API_KEYS.includes(provided)){
-      log.warn({ 事件:"鉴权失败", 请求ID: reqId });
-      return unauthorized();
+    const xApiKey = req.headers.get("x-api-key") ?? "";
+    
+    if (auth.startsWith("Bearer ")) {
+      downstreamToken = auth.slice(7);
+    } else if (xApiKey) {
+      // 支持Claude格式的x-api-key
+      downstreamToken = xApiKey;
+    }
+  } else {
+    // 正常模式：需要鉴权（支持Bearer和x-api-key两种格式）
+    if (API_KEYS.length > 0){
+      const auth = req.headers.get("authorization") ?? "";
+      const xApiKey = req.headers.get("x-api-key") ?? "";
+      
+      let provided = "";
+      if (auth.startsWith("Bearer ")) {
+        provided = auth.slice(7);
+      } else if (xApiKey) {
+        provided = xApiKey;
+      }
+      
+      if (!provided || !API_KEYS.includes(provided)){
+        log.warn({ 事件:"鉴权失败", 请求ID: reqId });
+        return unauthorized();
+      }
     }
   }
 
@@ -1078,7 +1326,12 @@ serve(async (req:Request): Promise<Response> => {
                             long_context: CONFIG.enableLongContext,
                             thinking_injection: CONFIG.enableThinkingInjection,
                             mcp_tools: CONFIG.enableMCP,
-                            deno_kv: USE_KV && kv !== null
+                            server_only_mode: CONFIG.serverOnly,
+                            claude_api: CONFIG.enableClaudeAPI,
+                            storage: {
+                              type: STORAGE_TYPE,
+                              active: storage !== null
+                            }
                           },
                           config: {
                             max_context_messages: CONFIG.maxContextMessages,
@@ -1310,7 +1563,7 @@ serve(async (req:Request): Promise<Response> => {
       stats.tokenUsage.clear();
       stats.lastResetTime = Date.now();
       
-      await saveStatsToKV(); // 重置后保存到 KV
+      await saveStatsToStorage(); // 重置后保存
       
       log.info({ 事件:"重置统计信息", 请求ID:reqId, 旧统计: oldStats });
       return jsonResponse({ success: true, message: "Statistics reset successfully", old_stats: oldStats });
@@ -1363,6 +1616,62 @@ serve(async (req:Request): Promise<Response> => {
     }
 
     if (req.method==="GET" && path==="/v1/models"){
+      // 仅服务端模式：使用下游token，不重试
+      if (serverOnlyMode) {
+        if (!downstreamToken) return unauthorized();
+        
+        const logCtx = { 请求ID:reqId, 上游: URL_MODELS, token: mask(downstreamToken), 模式: "仅服务端" };
+        try{
+          const resp = await fetchWithHeaderTimeout(URL_MODELS, {
+            method:"GET",
+            headers:{
+              "Authorization": `Bearer ${downstreamToken}`,
+              "Content-Type":"application/json",
+              "X-Request-ID": reqId
+            },
+            headerTimeoutMs: HEADER_TIMEOUT_MS,
+            logCtx
+          });
+
+          let raw = "";
+          let data: any = {};
+          try {
+            raw = await withTimeout(resp.text(), BODY_TIMEOUT_MS, "upstream body timeout (models)", logCtx);
+            log.debug({ 事件:"上游响应体(models原文)", 预览: raw.slice(0,700), 长度: raw.length, ...logCtx });
+            try { data = JSON.parse(raw); } catch { data = raw; }
+          } catch (e) {
+            log.warn({ 事件:"上游读取超时(models)", 错误:String((e as any)?.message ?? e), ...logCtx });
+            data = { error: { message: "upstream read timeout" } };
+          }
+
+          if (resp.status >= 200 && resp.status < 300) {
+            let openaiFormat;
+            if (data && Array.isArray(data.models)) {
+              const now = Math.floor(Date.now() / 1000);
+              openaiFormat = {
+                object: "list",
+                data: data.models.map((modelId: string) => ({
+                  id: modelId,
+                  object: "model",
+                  created: now,
+                  owned_by: "flowith"
+                }))
+              };
+            } else if (data && data.object === "list") {
+              openaiFormat = data;
+            } else {
+              openaiFormat = { object: "list", data: [] };
+            }
+            return jsonResponse(openaiFormat, resp.status);
+          }
+          
+          return jsonResponse(typeof data==='string'? { error:{ message:data } } : data, resp.status);
+        } catch (e) {
+          return gatewayError(e);
+        }
+      }
+      
+      // 正常模式：使用token池和重试
       if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
 
       let attempt = 0, lastErr:any = null;
@@ -1439,9 +1748,28 @@ serve(async (req:Request): Promise<Response> => {
     }
     if (req.method==="POST" && path==="/v1/chat/completions"){
       let body:any = {}; try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-      const { model, messages, stream=false, kb_list, max_tokens, max_completion_tokens, session_id, tools, tool_choice } = body ?? {};
+      const { model, messages, stream=false, kb_list, max_tokens, max_completion_tokens, session_id, tools, tool_choice, auto_session } = body ?? {};
       if (!Array.isArray(messages) || messages.length===0) return badRequest("`messages` is required and must be a non-empty array.");
-      if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
+      
+      // 仅服务端模式检查
+      if (serverOnlyMode && !downstreamToken) {
+        return unauthorized();
+      }
+      
+      if (!serverOnlyMode && TOKENS.length === 0) {
+        return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
+      }
+
+      // ============ 自动会话检测 ============
+      // 如果启用 auto_session 或没有提供 session_id 但启用了长上下文，则自动生成会话 ID
+      let effectiveSessionId = session_id;
+      if (CONFIG.enableLongContext && (auto_session === true || (auto_session !== false && !session_id))) {
+        // 生成基于 API key + 模型的自动会话 ID
+        const apiKeyForSession = req.headers.get("authorization")?.slice(7) || req.headers.get("x-api-key") || "anonymous";
+        const modelForSession = model || "default";
+        effectiveSessionId = generateAutoSessionId(apiKeyForSession, modelForSession);
+        log.info({ 事件:"自动会话", 会话ID: effectiveSessionId, 模型: modelForSession, ...{ 请求ID: reqId } });
+      }
 
       let normMessages = normalizeMessages(messages);
       let finalKbList: string[];
@@ -1451,17 +1779,17 @@ serve(async (req:Request): Promise<Response> => {
         // 用户提供了 kb_list 数组
         finalKbList = kb_list.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim());
         log.debug({ 事件:"使用提供的kb_list", kb_list: finalKbList, ...{ 请求ID: reqId } });
-      } else if (CONFIG.enableLongContext && session_id) {
+      } else if (CONFIG.enableLongContext && effectiveSessionId) {
         // 尝试从会话中获取
-        const sessionKbList = await sessionManager.getKbList(session_id);
+        const sessionKbList = await sessionManager.getKbList(effectiveSessionId);
         if (sessionKbList && sessionKbList.length > 0) {
           finalKbList = sessionKbList;
-          log.info({ 事件:"复用会话kb_list", sessionId: session_id, kb_list: finalKbList, ...{ 请求ID: reqId } });
+          log.info({ 事件:"复用会话kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
         } else {
           // 会话中没有，生成新的 UUID v4 数组
           finalKbList = [crypto.randomUUID()];
-          await sessionManager.setKbList(session_id, finalKbList);
-          log.info({ 事件:"生成新kb_list", sessionId: session_id, kb_list: finalKbList, ...{ 请求ID: reqId } });
+          await sessionManager.setKbList(effectiveSessionId, finalKbList);
+          log.info({ 事件:"生成新kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
         }
       } else {
         // 没有会话，生成新的 UUID v4 数组
@@ -1470,18 +1798,18 @@ serve(async (req:Request): Promise<Response> => {
       }
       
       // ============ 长上下文支持 ============
-      if (CONFIG.enableLongContext && session_id) {
-        const contextMessages = await sessionManager.getContext(session_id);
+      if (CONFIG.enableLongContext && effectiveSessionId) {
+        const contextMessages = await sessionManager.getContext(effectiveSessionId);
         if (contextMessages.length > 0) {
           // 合并历史上下文和当前消息
           normMessages = [...contextMessages, ...normMessages];
-          log.info({ 事件:"加载会话上下文", sessionId: session_id, 历史消息数: contextMessages.length, ...{ 请求ID: reqId } });
+          log.info({ 事件:"加载会话上下文", sessionId: effectiveSessionId, 历史消息数: contextMessages.length, ...{ 请求ID: reqId } });
         }
         
         // 保存当前用户消息
         const userMessage = normMessages[normMessages.length - 1];
         if (userMessage) {
-          await sessionManager.addMessage(session_id, userMessage.role, userMessage.content, finalKbList);
+          await sessionManager.addMessage(effectiveSessionId, userMessage.role, userMessage.content, finalKbList);
         }
       }
 
@@ -1536,15 +1864,85 @@ serve(async (req:Request): Promise<Response> => {
         事件:"请求处理", 
         模型: modelName, 
         消息数: normMessages.length,
-        会话ID: session_id ?? "无",
-        是否有会话: !!session_id,
+        会话ID: effectiveSessionId ?? "无",
+        是否有会话: !!effectiveSessionId,
+        自动会话: effectiveSessionId && !session_id,
         kb_list: finalKbList,
         kb_list数量: finalKbList.length,
         启用思考: CONFIG.enableThinkingInjection,
         启用MCP: CONFIG.enableMCP,
         工具数: mcpTools?.length ?? 0,
+        模式: serverOnlyMode ? "仅服务端" : "正常",
         ...{ 请求ID: reqId }
       });
+      
+      // ============ 仅服务端模式：不重试，直接透传 ============
+      if (serverOnlyMode) {
+        const logCtx = { 
+          请求ID:reqId, 
+          模型:modelName, 
+          token: mask(downstreamToken!),
+          模式: "仅服务端"
+        };
+        
+        try {
+          const result = await callUpstreamChat({
+            reqId, 
+            token: downstreamToken!, 
+            body: upstreamBody,
+            forceStream: false, 
+            isExternalStream, 
+            modelName
+          });
+          
+          if (result.kind === "stream") {
+            // 直接透传流式响应
+            stats.successRequests++;
+            return new Response(result.resp.body, {
+              headers: {
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache, no-transform",
+                "connection": "keep-alive",
+                "x-request-id": reqId,
+                "x-server-mode": "server-only"
+              }
+            });
+          } else {
+            const { status, content, headers } = result;
+            
+            if (status >= 200 && status < 300) {
+              stats.successRequests++;
+            } else {
+              stats.failedRequests++;
+            }
+            
+            let responseBody;
+            try {
+              responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
+            } catch {
+              responseBody = openaiNonStream(modelName, content);
+            }
+            
+            return new Response(
+              JSON.stringify(responseBody),
+              { 
+                status, 
+                headers: { 
+                  "content-type": "application/json", 
+                  "x-request-id": reqId,
+                  "x-server-mode": "server-only"
+                }
+              }
+            );
+          }
+        } catch (e) {
+          stats.failedRequests++;
+          log.error({ 事件: "仅服务端模式请求失败", 错误: String((e as any)?.message ?? e), ...logCtx });
+          return gatewayError(e);
+        }
+      }
+      
+      // ============ 正常模式：使用token池和重试 ============
       let attempt = 0, lastErr:any=null, lastStatus=0, lastContent="", lastHeaders:Headers|null=null;
       let needsRetry = false;
       let lastTokenIdx = -1;
@@ -1606,11 +2004,19 @@ serve(async (req:Request): Promise<Response> => {
                     controller.close(); return;
                 }
                 const reader = body.getReader();
-                const send = (obj:any)=> controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
                 let buf = "";
+                let thinkingBuffer = "";  // 用于拼凑思考内容
+                let isInThinking = false;  // 是否正在收集thinking
+                let hasOutputThinkingHeader = false;  // 是否已输出思考头部
+                
                 const safeClose = () => {
                   if (readerClosed) return;
                   readerClosed = true;
+                  // 如果还有未输出的thinking，先输出
+                  if (thinkingBuffer.trim()) {
+                    const thinkChunk = openaiChunk(modelName, `\n\n--- Response ---\n\n`);
+                    controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
+                  }
                   const doneObj = { id:"done", object:"chat.completion.chunk",
                     choices:[{ index:0, delta:{}, finish_reason:"stop"}],
                     created: Math.floor(Date.now()/1000), model: modelName };
@@ -1646,34 +2052,135 @@ serve(async (req:Request): Promise<Response> => {
                       resetIdle();
                       buf += dec.decode(value, { stream:true });
 
+                      // 处理多种分隔符：\n\n（SSE标准）、\n（text/plain）、}\n（JSON流）
+                      let processedAny = false;
+                      
+                      // 优先处理 \n\n 分隔（SSE标准格式）
                       let idx;
                       while ((idx = buf.indexOf("\n\n")) !== -1){
+                        processedAny = true;
                         const evt = buf.slice(0, idx); buf = buf.slice(idx+2);
+                        
+                        // 尝试解析SSE格式
                         const dataLines = evt.split("\n")
-                        .map(l => l.trimEnd())
-                        .filter(l => l.startsWith("data:"))
-                        .map(l => l.slice(5).trim());
-                        if (dataLines.length === 0) continue;
+                          .map(l => l.trimEnd())
+                          .filter(l => l.startsWith("data:"))
+                          .map(l => l.slice(5).trim());
+                        
+                        const data = dataLines.length > 0 ? dataLines.join("\n") : evt.trim();
+                        if (!data) continue;
+                        
+                        log.debug({ 事件:"上游流分片", 原文预览: data.slice(0,200), ...logCtx });
 
-                        const data = dataLines.join("\n");
-                        log.debug({ 事件:"上游SSE分片", 原文预览: data.slice(0,200), ...logCtx });
+                        // 检查是否为 [DONE] 标记
+                        if (data === "[DONE]") {
+                          log.debug({ 事件:"流式收到[DONE]标记", ...logCtx });
+                          safeClose();
+                          return;
+                        }
 
                         try{
                           const obj = JSON.parse(data);
-                          const delta = typeof obj?.content === "string"
-                          ? obj.content
-                          : (obj?.tag === "final" ? String(obj.content ?? "") : "");
-                          if (delta) controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
-                          if (obj?.tag === "final") { safeClose(); return; }
+                          // Flowith格式处理
+                          if (obj?.tag === "seeds") {
+                            log.debug({ 事件:"流式收到seeds标记", 内容: obj.content, ...logCtx });
+                            continue;
+                          }
+                          
+                          if (obj?.tag === "final") {
+                            const delta = typeof obj?.content === "string" ? obj.content : String(obj.content ?? "");
+                            if (delta === "[DONE]") {
+                              log.debug({ 事件:"流式收到final+[DONE]标记", ...logCtx });
+                              safeClose();
+                              return;
+                            }
+                            
+                            // 检测是否为thinking内容（仅当启用时）
+                            const isThinking = CONFIG.enableThinkingTags && 
+                              (obj?.type === "thinking" || delta.includes("<think>") || delta.includes("</think>"));
+                            
+                            if (CONFIG.enableThinkingTags && (isThinking || isInThinking)) {
+                              isInThinking = true;
+                              thinkingBuffer += delta;
+                              
+                              // 输出thinking头部（只输出一次）
+                              if (!hasOutputThinkingHeader) {
+                                hasOutputThinkingHeader = true;
+                                const headerChunk = openaiChunk(modelName, `\n<thinking>\n`);
+                                controller.enqueue(enc.encode(`data: ${JSON.stringify(headerChunk)}\n\n`));
+                              }
+                              
+                              // 立即输出thinking内容（不等待完整）
+                              if (delta) {
+                                const thinkChunk = openaiChunk(modelName, delta);
+                                controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
+                              }
+                              
+                              // 检测thinking结束
+                              if (delta.includes("</think>") || obj?.thinking_complete) {
+                                isInThinking = false;
+                                const endChunk = openaiChunk(modelName, `\n</thinking>\n\n`);
+                                controller.enqueue(enc.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
+                              }
+                            } else {
+                              // 正常内容
+                              if (delta) {
+                                // 性能优化：复用chunk对象
+                                if (CONFIG.enableStreamOptimization) {
+                                  controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
+                                } else {
+                                  const chunk = openaiChunk(modelName, delta);
+                                  controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                                }
+                              }
+                            }
+                          } else {
+                            // 其他格式兼容
+                            const delta = typeof obj?.content === "string" ? obj.content : "";
+                            if (delta) {
+                              const chunk = openaiChunk(modelName, delta);
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            }
+                          }
                         }catch{
+                          // JSON解析失败，尝试作为纯文本处理
                           const { delta, isFinal } = extractDeltaFromTextChunk(data);
-                          if (delta) controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
-                          if (isFinal) { safeClose(); return; }
+                          if (delta && delta !== "[DONE]") {
+                            const chunk = openaiChunk(modelName, delta);
+                            controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                          }
+                          if (isFinal || delta === "[DONE]") { safeClose(); return; }
+                        }
+                      }
+                      
+                      // 如果没有处理 \n\n 分隔符，尝试处理单个 \n（纯文本流）
+                      if (!processedAny && buf.includes("\n")) {
+                        const lines = buf.split("\n");
+                        buf = lines.pop() || "";  // 保留最后一行（可能不完整）
+                        
+                        for (const line of lines) {
+                          const trimmed = line.trim();
+                          if (!trimmed) continue;
+                          
+                          // 尝试解析JSON
+                          try {
+                            const obj = JSON.parse(trimmed);
+                            if (obj?.content) {
+                              const chunk = openaiChunk(modelName, obj.content);
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            }
+                          } catch {
+                            // 作为纯文本处理
+                            if (trimmed && trimmed !== "[DONE]") {
+                              const chunk = openaiChunk(modelName, trimmed);
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            }
+                          }
                         }
                       }
                     }
                   } catch (e) {
-                    log.warn({ 事件:"上游SSE读取异常", 错误:String((e as any)?.message ?? e), ...logCtx });
+                    log.warn({ 事件:"上游流读取异常", 错误:String((e as any)?.message ?? e), ...logCtx });
                   } finally {
                     safeClose();
                   }
@@ -1681,7 +2188,7 @@ serve(async (req:Request): Promise<Response> => {
             });
 
             stats.successRequests++;
-            await saveStatsToKV(); // 流式成功时保存统计
+            await saveStatsToStorage(); // 流式成功时保存统计
             return new Response(readable, {
               headers:{
                 "content-type":"text/event-stream; charset=utf-8",
@@ -1739,16 +2246,16 @@ serve(async (req:Request): Promise<Response> => {
               
               if (status >= 200 && status < 300 && !isEmpty) {
                 stats.successRequests++;
-                await saveStatsToKV(); // 成功时保存统计
+                await saveStatsToStorage(); // 成功时保存统计
                 
                 // 保存助手回复到会话
-                if (CONFIG.enableLongContext && session_id && content) {
-                  await sessionManager.addMessage(session_id, "assistant", content);
-                  log.debug({ 事件:"保存助手回复", sessionId: session_id, 字数: content.length, ...{ 请求ID: reqId } });
+                if (CONFIG.enableLongContext && effectiveSessionId && content) {
+                  await sessionManager.addMessage(effectiveSessionId, "assistant", content);
+                  log.debug({ 事件:"保存助手回复", sessionId: effectiveSessionId, 字数: content.length, 自动会话: effectiveSessionId && !session_id, ...{ 请求ID: reqId } });
                 }
               } else {
                 stats.failedRequests++;
-                await saveStatsToKV();
+                await saveStatsToStorage();
               }
               
               // 透传上游的错误状态和内容
@@ -1806,7 +2313,7 @@ serve(async (req:Request): Promise<Response> => {
       }
 
       stats.failedRequests++;
-      await saveStatsToKV(); // 失败时也保存统计
+      await saveStatsToStorage(); // 失败时也保存统计
       
       // 透传最后的错误状态和信息
       log.error({
@@ -1869,6 +2376,39 @@ serve(async (req:Request): Promise<Response> => {
       return gatewayTimeout("REQUEST_TIMED_OUT");
     }
 
+    // Claude API 兼容端点：/v1/messages
+    // 注意：目前只支持转换提示，实际使用请调用 /v1/chat/completions
+    if (req.method==="POST" && path==="/v1/messages" && CONFIG.enableClaudeAPI){
+      let claudeBody:any = {}; 
+      try { claudeBody = await req.json(); } catch { return badRequest("Invalid JSON body."); }
+      
+      const { model, messages, system, max_tokens, stream } = claudeBody ?? {};
+      if (!Array.isArray(messages) || messages.length===0) {
+        return badRequest("`messages` is required and must be a non-empty array.");
+      }
+      
+      // 转换为 OpenAI 格式
+      const convertedMessages = normalizeMessages(messages);
+      const finalMessages = system && typeof system === "string" 
+        ? [{ role: "system", content: system }, ...convertedMessages]
+        : convertedMessages;
+      
+      return jsonResponse({ 
+        message: "Please use /v1/chat/completions endpoint with OpenAI format",
+        converted_request: {
+          url: "/v1/chat/completions",
+          method: "POST",
+          headers: { "Authorization": "Bearer YOUR_API_KEY", "Content-Type": "application/json" },
+          body: {
+            model: model ?? "claude-3-5-sonnet",
+            messages: finalMessages,
+            stream: stream ?? false,
+            max_tokens
+          }
+        }
+      }, 200);
+    }
+
     stats.failedRequests++;
     return jsonResponse({ error:{ message:"Not Found", type:"not_found"} }, 404);
   } catch (e){
@@ -1876,20 +2416,23 @@ serve(async (req:Request): Promise<Response> => {
     log.error({ 事件:"处理异常", 错误:String((e as any)?.message ?? e), 堆栈: (e as any)?.stack, 请求ID:reqId });
     return gatewayError(e);
   }
-}, { port: PORT });
+}， { port: PORT });
 
 const rsyncMode = (Deno.env.get("RSYNC") ?? "0").trim() === "1";
-log.info({
+log。info({
   事件:"服务启动",
   端口: PORT,
   ORIGIN,
   TOKENS数量: TOKENS.length,
   TOKENS预览: TOKENS.slice(0, 3).map(mask),
-  KV存储: USE_KV && kv !== null ? "已启用" : "未启用",
+  存储类型: STORAGE_TYPE,
+  存储状态: storage !== null ? "已启用" : "未启用",
   同步模式: rsyncMode ? "完全同步(RSYNC=1)" : "差异同步",
   功能: {
     长上下文: CONFIG.enableLongContext,
     思考注入: CONFIG.enableThinkingInjection,
-    MCP工具: CONFIG.enableMCP
+    MCP工具: CONFIG.enableMCP,
+    仅服务端模式: CONFIG.serverOnly,
+    Claude_API: CONFIG.enableClaudeAPI
   }
 });
