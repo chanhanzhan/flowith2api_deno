@@ -230,7 +230,7 @@ function loadConfigFromEnv(): AppConfig {
   const storageType = (storageTypeEnv === "sqlite" || storageTypeEnv === "memory") ? storageTypeEnv : "kv";
 
   return {
-    // tokens 不从这里加载，而是通过 syncTokensFromEnv() 统一管理
+    // tokens 不从这里加载,而是通过 syncTokensFromEnv() 统一管理
     tokens: [],
     apiKeys: (Deno.env.get("API_KEYS") ?? "").split(",").map(s => s.trim()).filter(Boolean),
     adminKey: (Deno.env.get("ADMIN_KEY") ?? Deno.env.get("API_KEYS") ?? "").split(",")[0]?.trim() ?? "",
@@ -292,7 +292,7 @@ async function loadConfigFromStorage(): Promise<void> {
   }
 }
 
-// 兼容性：从配置对象读取值
+// 兼容性:从配置对象读取值
 const TOKENS: string[] = CONFIG.tokens;
 const API_KEYS = CONFIG.apiKeys;
 const ADMIN_KEY = CONFIG.adminKey;
@@ -400,13 +400,13 @@ interface Session {
   messages: Array<{ role: string; content: string; timestamp: number }>;
   createdAt: number;
   lastAccessedAt: number;
-  kbList?: string[];  // 保存 kb_list UUID v4 数组，连续对话时复用
+  kbList?: string[];  // 保存 kb_list UUID v4 数组,连续对话时复用
   metadata?: Record<string, any>;
-  apiKey?: string;    // 关联的 API key（用于自动会话）
-  model?: string;     // 关联的模型（用于自动会话）
+  apiKey?: string;    // 关联的 API key(用于自动会话)
+  model?: string;     // 关联的模型(用于自动会话)
 }
 
-// 生成自动会话 ID（基于 API key + 模型）
+// 生成自动会话 ID(基于 API key + 模型)
 function generateAutoSessionId(apiKey: string, model: string): string {
   const key = `auto_${apiKey}_${model}`.replace(/[^a-zA-Z0-9_-]/g, '_');
   return key.substring(0, 100); // 限制长度
@@ -477,7 +477,7 @@ class SessionManager {
       session.messages = session.messages.slice(-CONFIG.maxContextMessages);
     }
 
-    // 更新或设置 kb_list（如果提供）
+    // 更新或设置 kb_list(如果提供)
     if (kbList && kbList.length > 0) {
       session.kbList = kbList;
     }
@@ -531,7 +531,7 @@ class SessionManager {
 
 const sessionManager = new SessionManager();
 
-// 定期清理过期会话（每5分钟）
+// 定期清理过期会话(每5分钟)
 if (CONFIG.enableLongContext) {
   setInterval(() => {
     sessionManager.cleanupExpiredSessions().catch(e =>
@@ -617,11 +617,11 @@ const MCP_TOOLS: MCPTool[] = [
 if (storage) {
   await loadConfigFromStorage();  // 先加载配置
   await loadTokensFromStorage();  // 从存储加载已保存的tokens
-  await syncTokensFromEnv(); // 同步环境变量中的tokens（差异或完全同步）
+  await syncTokensFromEnv(); // 同步环境变量中的tokens(差异或完全同步)
   await loadStatsFromStorage();
-  await saveConfigToStorage();  // 保存当前配置（如果存储中没有）
+  await saveConfigToStorage();  // 保存当前配置(如果存储中没有)
 } else {
-  // 如果没有存储，也执行环境变量同步（只是不保存）
+  // 如果没有存储,也执行环境变量同步(只是不保存)
   const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
   const envTokens = Array.from(new Set(
     envTokensStr.split(",").map(s => s.trim()).filter(Boolean)
@@ -632,7 +632,7 @@ if (storage) {
   }
 }
 
-// 定期保存统计数据（每30秒）
+// 定期保存统计数据(每30秒)
 if (storage) {
   setInterval(() => {
     saveStatsToStorage().catch(e => console.error("[Storage] Auto-save stats failed:", e));
@@ -645,17 +645,17 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 const rrBuf = new SharedArrayBuffer(4);
 const rrView = new Int32Array(rrBuf);
 
-// 初始化轮询索引（从0开始）
+// 初始化轮询索引(从0开始)
 Atomics.store(rrView, 0, 0);
 
 /**
- * 获取下一个token（按顺序轮询）
- * 实现方式：使用原子操作确保并发安全
+ * 获取下一个token(按顺序轮询)
+ * 实现方式:使用原子操作确保并发安全
  * 第1次请求 -> token[0]
  * 第2次请求 -> token[1]
  * 第3次请求 -> token[2]
  * ...
- * 第N+1次请求 -> token[0]（循环）
+ * 第N+1次请求 -> token[0](循环)
  */
 function nextToken(): { idx:number, token:string, totalCalls: number } | null {
   const n = TOKENS.length;
@@ -664,7 +664,7 @@ function nextToken(): { idx:number, token:string, totalCalls: number } | null {
     return null;
   }
   
-  // 原子操作：获取当前索引并自增
+  // 原子操作:获取当前索引并自增
   const currentIndex = Atomics.load(rrView, 0);
   const nextIndex = (currentIndex + 1) % n;
   Atomics.store(rrView, 0, nextIndex);
@@ -686,7 +686,7 @@ function nextToken(): { idx:number, token:string, totalCalls: number } | null {
 }
 
 /**
- * 获取当前轮询状态（不移动索引）
+ * 获取当前轮询状态(不移动索引)
  */
 function getCurrentTokenIndex(): number {
   return Atomics.load(rrView, 0) % TOKENS.length;
@@ -715,12 +715,12 @@ function isAdminAuthorized(req:Request): boolean {
   const auth = req.headers.get("authorization") ?? "";
   const provided = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   
-  // 优先使用 ADMIN_KEY，如果没有则使用 API_KEYS
+  // 优先使用 ADMIN_KEY,如果没有则使用 API_KEYS
   if (ADMIN_KEY) {
     return provided === ADMIN_KEY;
   }
   
-  // 如果没有 ADMIN_KEY，则检查 API_KEYS（任何一个 API_KEY 都可以作为管理员）
+  // 如果没有 ADMIN_KEY,则检查 API_KEYS(任何一个 API_KEY 都可以作为管理员)
   if (API_KEYS.length > 0) {
     return API_KEYS.includes(provided);
   }
@@ -766,7 +766,7 @@ async function addTokensBatch(tokens: string[]): Promise<{ success:boolean, mess
     try {
       await saveTokensToStorage();
     } catch (e) {
-      // 如果保存失败，回滚已添加的tokens
+      // 如果保存失败,回滚已添加的tokens
       TOKENS.splice(-added);
       return {
         success: false,
@@ -840,14 +840,14 @@ async function syncTokensFromEnv(): Promise<void> {
   }
   
   if (rsyncMode) {
-    // 完全同步模式：清空存储，完全替换
+    // 完全同步模式:清空存储,完全替换
     console.log(`[Sync] RSYNC mode enabled: clearing all tokens and loading ${envTokens.length} tokens from environment`);
     TOKENS.length = 0;
     TOKENS.push(...envTokens);
     await saveTokensToStorage();
     console.log(`[Sync] Full sync completed: ${TOKENS.length} tokens loaded`);
   } else {
-    // 差异同步模式：只添加新的token，保留存储中已有的
+    // 差异同步模式:只添加新的token,保留存储中已有的
     const existingSet = new Set(TOKENS);
     const newTokens: string[] = [];
     
@@ -1091,7 +1091,7 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
         const data = dataLines.join("\n");
         log.debug({ 事件:"上游SSE分片(聚合)", 原文预览: data.slice(0, 200), 块序号: chunkCount, ...logCtx });
 
-        // 检查是否为 [DONE] 标记（非JSON格式）
+        // 检查是否为 [DONE] 标记(非JSON格式)
         if (data === "[DONE]") {
           log.debug({ 事件:"收到[DONE]标记", ...logCtx });
           readerClosed = true;
@@ -1100,9 +1100,9 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
 
         try {
           const obj = JSON.parse(data);
-          // Flowith格式：每个chunk都有tag:final，只有content为"[DONE]"时才真正结束
+          // Flowith格式:每个chunk都有tag:final,只有content为"[DONE]"时才真正结束
           if (obj?.tag === "seeds") {
-            // seeds标记，跳过
+            // seeds标记,跳过
             log.debug({ 事件:"收到seeds标记", 内容: obj.content, ...logCtx });
             continue;
           }
@@ -1115,7 +1115,7 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
               readerClosed = true;
               break;
             }
-            // 正常内容，累加
+            // 正常内容,累加
           if (delta) content += delta;
           } else {
             // 其他格式兼容
@@ -1123,7 +1123,7 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
             if (delta) content += delta;
           }
         } catch {
-          // JSON解析失败，尝试提取文本
+          // JSON解析失败,尝试提取文本
           const { delta, isFinal } = extractDeltaFromTextChunk(data);
           if (delta && delta !== "[DONE]") content += delta;
           if (isFinal || delta === "[DONE]") { readerClosed = true; break; }
@@ -1192,10 +1192,10 @@ async function callUpstreamChat(opts: {
   const status = resp.status;
   const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
 
-  // 对于外部流式请求，无论上游返回什么content-type都需要转换为标准SSE格式
-  // 因为上游可能返回 text/plain，需要统一处理
+  // 对于外部流式请求,无论上游返回什么content-type都需要转换为标准SSE格式
+  // 因为上游可能返回 text/plain,需要统一处理
   if (isExternalStream && upstreamStream) {
-    // 不再直接透传，而是进行格式转换
+    // 不再直接透传,而是进行格式转换
     return { kind:"stream", resp };
   }
 
@@ -1253,7 +1253,7 @@ serve(async (req:Request): Promise<Response> => {
   const path = url.pathname;
   const reqId = genReqId(req.headers);
   
-  // 仅服务端模式：跳过API_KEYS鉴权，直接透传下游的Authorization
+  // 仅服务端模式:跳过API_KEYS鉴权,直接透传下游的Authorization
   const serverOnlyMode = CONFIG.serverOnly;
   let downstreamToken: string | null = null;
   
@@ -1269,7 +1269,7 @@ serve(async (req:Request): Promise<Response> => {
       downstreamToken = xApiKey;
     }
   } else {
-    // 正常模式：需要鉴权（支持Bearer和x-api-key两种格式）
+    // 正常模式:需要鉴权(支持Bearer和x-api-key两种格式)
     if (API_KEYS.length > 0){
       const auth = req.headers.get("authorization") ?? "";
       const xApiKey = req.headers.get("x-api-key") ?? "";
@@ -1367,7 +1367,7 @@ serve(async (req:Request): Promise<Response> => {
         
         let tokensToAdd: string[] = [];
         
-        // 支持两种格式：
+        // 支持两种格式:
         // 1. { "tokens": ["token1", "token2", ...] }
         // 2. { "tokens": "token1,token2,token3" } - 逗号分隔的字符串
         if (body.tokens) {
@@ -1414,7 +1414,7 @@ serve(async (req:Request): Promise<Response> => {
         
         let tokensToRemove: string[] = [];
         
-        // 支持两种格式：
+        // 支持两种格式:
         // 1. { "tokens": ["token1", "token2", ...] }
         // 2. { "tokens": "token1,token2,token3" } - 逗号分隔的字符串
         if (body.tokens) {
@@ -1475,7 +1475,7 @@ serve(async (req:Request): Promise<Response> => {
         return forbidden();
       }
       
-      // GET: 列出所有tokens（带掩码和详细信息）
+      // GET: 列出所有tokens(带掩码和详细信息)
       if (req.method==="GET"){
         log.info({ 事件:"列出tokens", 请求ID:reqId, 数量: TOKENS.length });
         return jsonResponse({
@@ -1576,7 +1576,7 @@ serve(async (req:Request): Promise<Response> => {
         return forbidden();
       }
       
-      // GET: 查看会话（需要session_id参数）
+      // GET: 查看会话(需要session_id参数)
       if (req.method==="GET"){
         const sessionId = url.searchParams.get("session_id");
         if (!sessionId) return badRequest("`session_id` query parameter is required.");
@@ -1616,7 +1616,7 @@ serve(async (req:Request): Promise<Response> => {
     }
 
     if (req.method==="GET" && path==="/v1/models"){
-      // 仅服务端模式：使用下游token，不重试
+      // 仅服务端模式:使用下游token,不重试
       if (serverOnlyMode) {
         if (!downstreamToken) return unauthorized();
         
@@ -1671,7 +1671,7 @@ serve(async (req:Request): Promise<Response> => {
         }
       }
       
-      // 正常模式：使用token池和重试
+      // 正常模式:使用token池和重试
       if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
 
       let attempt = 0, lastErr:any = null;
@@ -1719,10 +1719,10 @@ serve(async (req:Request): Promise<Response> => {
               };
               log.info({ 事件:"模型列表转换", 原始数量: data.count, 转换后数量: openaiFormat.data.length, ...logCtx });
             } else if (data && data.object === "list") {
-              // 已经是 OpenAI 格式，直接返回
+              // 已经是 OpenAI 格式,直接返回
               openaiFormat = data;
             } else {
-              // 未知格式，返回空列表
+              // 未知格式,返回空列表
               log.warn({ 事件:"未知模型列表格式", 数据: data, ...logCtx });
               openaiFormat = {
                 object: "list",
@@ -1761,7 +1761,7 @@ serve(async (req:Request): Promise<Response> => {
       }
 
       // ============ 自动会话检测 ============
-      // 如果启用 auto_session 或没有提供 session_id 但启用了长上下文，则自动生成会话 ID
+      // 如果启用 auto_session 或没有提供 session_id 但启用了长上下文,则自动生成会话 ID
       let effectiveSessionId = session_id;
       if (CONFIG.enableLongContext && (auto_session === true || (auto_session !== false && !session_id))) {
         // 生成基于 API key + 模型的自动会话 ID
@@ -1774,7 +1774,7 @@ serve(async (req:Request): Promise<Response> => {
       let normMessages = normalizeMessages(messages);
       let finalKbList: string[];
       
-      // ============ kb_list 处理（必须字段，UUID v4 数组） ============
+      // ============ kb_list 处理(必须字段,UUID v4 数组) ============
       if (Array.isArray(kb_list) && kb_list.length > 0) {
         // 用户提供了 kb_list 数组
         finalKbList = kb_list.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim());
@@ -1786,13 +1786,13 @@ serve(async (req:Request): Promise<Response> => {
           finalKbList = sessionKbList;
           log.info({ 事件:"复用会话kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
         } else {
-          // 会话中没有，生成新的 UUID v4 数组
+          // 会话中没有,生成新的 UUID v4 数组
           finalKbList = [crypto.randomUUID()];
           await sessionManager.setKbList(effectiveSessionId, finalKbList);
           log.info({ 事件:"生成新kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
         }
       } else {
-        // 没有会话，生成新的 UUID v4 数组
+        // 没有会话,生成新的 UUID v4 数组
         finalKbList = [crypto.randomUUID()];
         log.info({ 事件:"生成新kb_list(无会话)", kb_list: finalKbList, ...{ 请求ID: reqId } });
       }
@@ -1819,14 +1819,14 @@ serve(async (req:Request): Promise<Response> => {
         const hasSystemMessage = normMessages.some(m => m.role === "system");
         
         if (!hasSystemMessage) {
-          // 如果没有system消息，在最前面添加
+          // 如果没有system消息,在最前面添加
           normMessages.unshift({
             role: "system",
             content: CONFIG.thinkingPrompt
           });
           log.debug({ 事件:"注入思考提示(前置)", 提示: CONFIG.thinkingPrompt.slice(0, 50) + "...", ...{ 请求ID: reqId } });
         } else {
-          // 如果已有system消息，追加到第一个system消息的内容后
+          // 如果已有system消息,追加到第一个system消息的内容后
           const firstSystemIdx = normMessages.findIndex(m => m.role === "system");
           if (firstSystemIdx !== -1) {
             normMessages[firstSystemIdx].content += "\n\n" + CONFIG.thinkingPrompt;
@@ -1840,8 +1840,8 @@ serve(async (req:Request): Promise<Response> => {
       : Number.isFinite(max_tokens) ? max_tokens : undefined;
 
       // ============ MCP工具支持 ============
-      // 只有在用户明确提供tools时才使用，否则不自动注入
-      // 某些模型可能不支持tools参数，导致上游报错
+      // 只有在用户明确提供tools时才使用,否则不自动注入
+      // 某些模型可能不支持tools参数,导致上游报错
       const mcpTools = tools && tools.length > 0 
         ? tools 
         : (CONFIG.enableMCP && tool_choice 
@@ -1850,7 +1850,7 @@ serve(async (req:Request): Promise<Response> => {
 
       const upstreamBody:any = {
         messages: normMessages,
-        kb_list: finalKbList,  // 必须字段，UUID v4 数组
+        kb_list: finalKbList,  // 必须字段,UUID v4 数组
       stream: isExternalStream,
       ...(model? {model}:{}),
         ...(Number.isFinite(maxTok)? { max_tokens:maxTok }:{}),
@@ -1876,7 +1876,7 @@ serve(async (req:Request): Promise<Response> => {
         ...{ 请求ID: reqId }
       });
       
-      // ============ 仅服务端模式：不重试，直接透传 ============
+      // ============ 仅服务端模式:不重试,直接透传 ============
       if (serverOnlyMode) {
         const logCtx = { 
           请求ID:reqId, 
@@ -1942,7 +1942,7 @@ serve(async (req:Request): Promise<Response> => {
         }
       }
       
-      // ============ 正常模式：使用token池和重试 ============
+      // ============ 正常模式:使用token池和重试 ============
       let attempt = 0, lastErr:any=null, lastStatus=0, lastContent="", lastHeaders:Headers|null=null;
       let needsRetry = false;
       let lastTokenIdx = -1;
@@ -2012,7 +2012,7 @@ serve(async (req:Request): Promise<Response> => {
                 const safeClose = () => {
                   if (readerClosed) return;
                   readerClosed = true;
-                  // 如果还有未输出的thinking，先输出
+                  // 如果还有未输出的thinking,先输出
                   if (thinkingBuffer.trim()) {
                     const thinkChunk = openaiChunk(modelName, `\n\n--- Response ---\n\n`);
                     controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
@@ -2052,10 +2052,10 @@ serve(async (req:Request): Promise<Response> => {
                       resetIdle();
                       buf += dec.decode(value, { stream:true });
 
-                      // 处理多种分隔符：\n\n（SSE标准）、\n（text/plain）、}\n（JSON流）
+                      // 处理多种分隔符:\n\n(SSE标准)、\n(text/plain)、}\n(JSON流)
                       let processedAny = false;
                       
-                      // 优先处理 \n\n 分隔（SSE标准格式）
+                      // 优先处理 \n\n 分隔(SSE标准格式)
                       let idx;
                       while ((idx = buf.indexOf("\n\n")) !== -1){
                         processedAny = true;
@@ -2095,7 +2095,7 @@ serve(async (req:Request): Promise<Response> => {
                               return;
                             }
                             
-                            // 检测是否为thinking内容（仅当启用时）
+                            // 检测是否为thinking内容(仅当启用时)
                             const isThinking = CONFIG.enableThinkingTags && 
                               (obj?.type === "thinking" || delta.includes("<think>") || delta.includes("</think>"));
                             
@@ -2103,14 +2103,14 @@ serve(async (req:Request): Promise<Response> => {
                               isInThinking = true;
                               thinkingBuffer += delta;
                               
-                              // 输出thinking头部（只输出一次）
+                              // 输出thinking头部(只输出一次)
                               if (!hasOutputThinkingHeader) {
                                 hasOutputThinkingHeader = true;
                                 const headerChunk = openaiChunk(modelName, `\n<thinking>\n`);
                                 controller.enqueue(enc.encode(`data: ${JSON.stringify(headerChunk)}\n\n`));
                               }
                               
-                              // 立即输出thinking内容（不等待完整）
+                              // 立即输出thinking内容(不等待完整)
                               if (delta) {
                                 const thinkChunk = openaiChunk(modelName, delta);
                                 controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
@@ -2125,7 +2125,7 @@ serve(async (req:Request): Promise<Response> => {
                             } else {
                               // 正常内容
                               if (delta) {
-                                // 性能优化：复用chunk对象
+                                // 性能优化:复用chunk对象
                                 if (CONFIG.enableStreamOptimization) {
                                   controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
                                 } else {
@@ -2143,7 +2143,7 @@ serve(async (req:Request): Promise<Response> => {
                             }
                           }
                         }catch{
-                          // JSON解析失败，尝试作为纯文本处理
+                          // JSON解析失败,尝试作为纯文本处理
                           const { delta, isFinal } = extractDeltaFromTextChunk(data);
                           if (delta && delta !== "[DONE]") {
                             const chunk = openaiChunk(modelName, delta);
@@ -2153,10 +2153,10 @@ serve(async (req:Request): Promise<Response> => {
                         }
                       }
                       
-                      // 如果没有处理 \n\n 分隔符，尝试处理单个 \n（纯文本流）
+                      // 如果没有处理 \n\n 分隔符,尝试处理单个 \n(纯文本流)
                       if (!processedAny && buf.includes("\n")) {
                         const lines = buf.split("\n");
-                        buf = lines.pop() || "";  // 保留最后一行（可能不完整）
+                        buf = lines.pop() || "";  // 保留最后一行(可能不完整)
                         
                         for (const line of lines) {
                           const trimmed = line.trim();
@@ -2210,7 +2210,7 @@ serve(async (req:Request): Promise<Response> => {
               retryReason = isEmpty ? "返回为空" : "数据截断";
             }
             
-            // 2. 检查上游错误状态码（如果配置了可重试的状态码）
+            // 2. 检查上游错误状态码(如果配置了可重试的状态码)
             if (!shouldRetry && status >= 400 && RETRY_ON_STATUS.has(status) && attempt < RETRY_MAX) {
               shouldRetry = true;
               retryReason = `上游返回错误状态 ${status}`;
@@ -2261,10 +2261,10 @@ serve(async (req:Request): Promise<Response> => {
               // 透传上游的错误状态和内容
               let responseBody;
               try {
-                // 尝试解析为 JSON（上游可能返回结构化错误）
+                // 尝试解析为 JSON(上游可能返回结构化错误)
                 responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
               } catch {
-                // 解析失败，包装为标准格式
+                // 解析失败,包装为标准格式
                 responseBody = openaiNonStream(modelName, content);
               }
               
@@ -2297,7 +2297,7 @@ serve(async (req:Request): Promise<Response> => {
         attempt++;
         if (attempt > RETRY_MAX) break;
         
-        // 预测下一个将使用的密钥（用于日志显示）
+        // 预测下一个将使用的密钥(用于日志显示)
         const nextKeyIdx = Atomics.load(rrView, 0) % TOKENS.length;
         const nextKeyPreview = TOKENS.length > 0 ? `第${nextKeyIdx + 1}个(${mask(TOKENS[nextKeyIdx])})` : "无";
         
@@ -2335,7 +2335,7 @@ serve(async (req:Request): Promise<Response> => {
         try {
           errorBody = JSON.parse(lastContent);
         } catch {
-          // 解析失败，包装为标准错误格式
+          // 解析失败,包装为标准错误格式
           errorBody = {
             error: {
               message: lastContent.slice(0, 500),
@@ -2376,8 +2376,8 @@ serve(async (req:Request): Promise<Response> => {
       return gatewayTimeout("REQUEST_TIMED_OUT");
     }
 
-    // Claude API 兼容端点：/v1/messages
-    // 注意：目前只支持转换提示，实际使用请调用 /v1/chat/completions
+    // Claude API 兼容端点:/v1/messages
+    // 注意:目前只支持转换提示,实际使用请调用 /v1/chat/completions
     if (req.method==="POST" && path==="/v1/messages" && CONFIG.enableClaudeAPI){
       let claudeBody:any = {}; 
       try { claudeBody = await req.json(); } catch { return badRequest("Invalid JSON body."); }
@@ -2416,10 +2416,10 @@ serve(async (req:Request): Promise<Response> => {
     log.error({ 事件:"处理异常", 错误:String((e as any)?.message ?? e), 堆栈: (e as any)?.stack, 请求ID:reqId });
     return gatewayError(e);
   }
-}， { port: PORT });
+}, { port: PORT });
 
 const rsyncMode = (Deno.env.get("RSYNC") ?? "0").trim() === "1";
-log。info({
+log.info({
   事件:"服务启动",
   端口: PORT,
   ORIGIN,
