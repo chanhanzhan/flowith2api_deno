@@ -268,8 +268,8 @@ async function initStorage(): Promise<void> {
       }
       
       if (denoKv) {
-        kv = denoKv; // 保留向后兼容
-        storage = new DenoKVAdapter(denoKv);
+      kv = denoKv; // 保留向后兼容
+      storage = new DenoKVAdapter(denoKv);
       } else {
         throw new Error("Failed to initialize Deno KV");
       }
@@ -302,7 +302,7 @@ async function initStorage(): Promise<void> {
         name: "Memory",
         init: async () => {
           console.log("[Storage] Trying memory storage fallback...");
-          storage = new MemoryAdapter();
+    storage = new MemoryAdapter();
         }
       }
     ];
@@ -506,14 +506,36 @@ const log = {
   error:(o:any)=>logAt("error",o),
 };
 // ============ 数据操作函数 ============
+// Token分片大小（每个分片最多存储的token数量）
+// Deno KV单个值最大64KB，保守起见每片存储50个token
+const TOKENS_CHUNK_SIZE = 50;
+
 async function loadTokensFromStorage(): Promise<void> {
   if (!storage) return;
   try {
+    // 先尝试加载元数据
+    const meta = await storage.get<{ total: number; chunks: number }>(["tokens_meta"]);
+    
+    if (meta && meta.chunks > 0) {
+      // 从分片加载
+      TOKENS.length = 0;
+      for (let i = 0; i < meta.chunks; i++) {
+        const chunk = await storage.get<string[]>(["tokens_chunk", String(i)]);
+        if (chunk && Array.isArray(chunk)) {
+          TOKENS.push(...chunk);
+        }
+      }
+      console.log(`[Storage] Loaded ${TOKENS.length} tokens from ${meta.chunks} chunk(s)`);
+    } else {
+      // 尝试加载旧格式（兼容性）
     const value = await storage.get<string[]>(["tokens"]);
     if (value && Array.isArray(value)) {
       TOKENS.length = 0;
       TOKENS.push(...value);
-      console.log(`[Storage] Loaded ${TOKENS.length} tokens`);
+        console.log(`[Storage] Loaded ${TOKENS.length} tokens (legacy format)`);
+        // 转换为新格式
+        await saveTokensToStorage();
+      }
     }
   } catch (e) {
     console.error("[Storage] Failed to load tokens:", e);
@@ -523,10 +545,46 @@ async function loadTokensFromStorage(): Promise<void> {
 async function saveTokensToStorage(): Promise<void> {
   if (!storage) return;
   try {
-    await storage.set(["tokens"], TOKENS);
-    console.log(`[Storage] Saved ${TOKENS.length} tokens`);
+    // 计算需要的分片数量
+    const chunks = Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE);
+    
+    // 保存每个分片
+    for (let i = 0; i < chunks; i++) {
+      const start = i * TOKENS_CHUNK_SIZE;
+      const end = Math.min(start + TOKENS_CHUNK_SIZE, TOKENS.length);
+      const chunk = TOKENS.slice(start, end);
+      await storage.set(["tokens_chunk", String(i)], chunk);
+    }
+    
+    // 删除旧的多余分片（如果tokens数量减少了）
+    const oldMeta = await storage.get<{ chunks: number }>(["tokens_meta"]);
+    if (oldMeta && oldMeta.chunks > chunks) {
+      for (let i = chunks; i < oldMeta.chunks; i++) {
+        await storage.delete(["tokens_chunk", String(i)]);
+      }
+    }
+    
+    // 保存元数据
+    await storage.set(["tokens_meta"], {
+      total: TOKENS.length,
+      chunks: chunks,
+      updated_at: Date.now()
+    });
+    
+    // 删除旧格式的数据（如果存在）
+    const legacy = await storage.get(["tokens"]);
+    if (legacy) {
+      await storage.delete(["tokens"]);
+    }
+    
+    console.log(`[Storage] Saved ${TOKENS.length} tokens in ${chunks} chunk(s)`);
   } catch (e) {
     console.error("[Storage] Failed to save tokens:", e);
+    // 如果分片保存失败，尝试警告用户
+    if (String(e).includes("Value too large")) {
+      console.error("[Storage] ERROR: Token storage exceeded limits even with chunking!");
+      console.error("[Storage] Consider using SQLite storage (STORAGE_TYPE=sqlite) for large token sets");
+    }
   }
 }
 
@@ -1138,6 +1196,432 @@ const COMMON_TOOLS = [
   "image_gen",
   "code_interpreter"
 ];
+
+// ============ 工具调用检测 ============
+// 从AI响应中提取工具调用请求
+function extractToolCalls(content: string): Array<{ name: string; arguments: any }> {
+  const toolCalls: Array<{ name: string; arguments: any }> = [];
+  
+  // 匹配类似 <tool_call name="file_read">{"path": "test.txt"}</tool_call> 的格式
+  const xmlPattern = /<tool_call\s+name="([^"]+)"\s*>(.*?)<\/tool_call>/gs;
+  let match;
+  while ((match = xmlPattern.exec(content)) !== null) {
+    try {
+      const name = match[1];
+      const args = JSON.parse(match[2]);
+      toolCalls.push({ name, arguments: args });
+    } catch {}
+  }
+  
+  // 如果没找到XML格式，尝试匹配JSON格式
+  if (toolCalls.length === 0) {
+    // 匹配 ```json\n{"tool": "xxx", "arguments": {...}}\n``` 格式
+    const jsonPattern = /```json\s*\n\s*\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}\s*\n```/gs;
+    while ((match = jsonPattern.exec(content)) !== null) {
+      try {
+        const name = match[1];
+        const args = JSON.parse(match[2]);
+        toolCalls.push({ name, arguments: args });
+      } catch {}
+    }
+  }
+  
+  return toolCalls;
+}
+
+// 构造工具调用提示词
+function buildToolCallPrompt(tools: any[]): string {
+  const toolNames = tools.map(t => t.function.name).join(", ");
+  return `
+When you need to use a tool, respond EXACTLY in this format:
+<tool_call name="TOOL_NAME">{"param1": "value1", "param2": "value2"}</tool_call>
+
+Available tools: ${toolNames}
+
+Example:
+<tool_call name="file_read">{"path": "./test.txt"}</tool_call>
+
+You can call multiple tools in one response. After the tool execution, I will provide the results and you can continue.
+`.trim();
+}
+
+// ============ 工具调用代理循环 ============
+async function chatWithToolProxy(opts: {
+  reqId: string;
+  token: string;
+  body: any;
+  modelName: string;
+  mcpTools: any[];
+  maxIterations?: number;
+}): Promise<{ kind: "nonstream"; status: number; content: string; headers: Headers; isEmpty?: boolean; isTruncated?: boolean; toolExecutions?: any[] }> {
+  const { reqId, token, body, modelName, mcpTools, maxIterations = 5 } = opts;
+  const logCtx = { 请求ID: reqId, 模型: modelName };
+  
+  let conversation = [...body.messages];
+  const toolExecutions: any[] = [];
+  
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    log.debug({ 事件: "工具代理循环", 迭代: iteration + 1, ...logCtx });
+    
+    // 调用上游API
+    const result = await callUpstreamChat({
+      reqId,
+      token,
+      body: { ...body, messages: conversation },
+      forceStream: false,
+      isExternalStream: false,
+      modelName
+    });
+    
+    if (result.kind === "stream") {
+      // 不应该发生，因为 forceStream=false
+      log.warn({ 事件: "工具代理收到流式响应", ...logCtx });
+      return { kind: "nonstream", status: 500, content: "Unexpected stream response", headers: new Headers(), toolExecutions };
+    }
+    
+    const { status, content, headers } = result;
+    
+    // 非2xx响应，直接返回
+    if (status < 200 || status >= 300) {
+      return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions };
+    }
+    
+    // 提取工具调用
+    const toolCalls = extractToolCalls(content);
+    
+    if (toolCalls.length === 0) {
+      // 没有工具调用，返回最终答案
+      log.info({ 事件: "工具代理完成", 迭代次数: iteration + 1, 工具执行次数: toolExecutions.length, ...logCtx });
+      return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions };
+    }
+    
+    // 执行所有工具调用
+    log.info({ 事件: "检测到工具调用", 工具数: toolCalls.length, 工具: toolCalls.map(t => t.name), ...logCtx });
+    
+    const results: any[] = [];
+    for (const call of toolCalls) {
+      const execution = await executeToolCall(call.name, call.arguments);
+      results.push({
+        tool: call.name,
+        arguments: call.arguments,
+        ...execution
+      });
+      toolExecutions.push({
+        iteration: iteration + 1,
+        tool: call.name,
+        arguments: call.arguments,
+        ...execution
+      });
+    }
+    
+    // 将AI响应添加到对话
+    conversation.push({
+      role: "assistant",
+      content: content
+    });
+    
+    // 将工具执行结果添加到对话
+    const toolResultsText = results.map((r, i) => 
+      `Tool: ${r.tool}\nSuccess: ${r.success}\nResult: ${r.success ? r.result : r.error}`
+    ).join("\n\n");
+    
+    conversation.push({
+      role: "user",
+      content: `Tool execution results:\n\n${toolResultsText}\n\nPlease continue based on these results. If you need more tools, use the same format. Otherwise, provide the final answer.`
+    });
+    
+    log.debug({ 事件: "工具结果已添加到对话", 结果数: results.length, ...logCtx });
+  }
+  
+  // 达到最大迭代次数
+  log.warn({ 事件: "工具代理达到最大迭代", 迭代次数: maxIterations, ...logCtx });
+  return {
+    kind: "nonstream",
+    status: 200,
+    content: "Maximum tool execution iterations reached. Please simplify your request.",
+    headers: new Headers(),
+    isEmpty: false,
+    isTruncated: false,
+    toolExecutions
+  };
+}
+
+// ============ 工具执行引擎 ============
+async function executeToolCall(toolName: string, args: any): Promise<{ success: boolean; result?: any; error?: string }> {
+  try {
+    log.debug({ 事件: "执行工具调用", 工具: toolName, 参数: args });
+    
+    switch (toolName) {
+      case "file_read": {
+        const { path } = args;
+        if (!path) return { success: false, error: "Missing required parameter: path" };
+        try {
+          const content = await Deno.readTextFile(path);
+          return { success: true, result: content };
+        } catch (e) {
+          return { success: false, error: `Failed to read file: ${e}` };
+        }
+      }
+      
+      case "file_write": {
+        const { path, content } = args;
+        if (!path || content === undefined) return { success: false, error: "Missing required parameters: path, content" };
+        try {
+          await Deno.writeTextFile(path, content);
+          return { success: true, result: `File written successfully: ${path}` };
+        } catch (e) {
+          return { success: false, error: `Failed to write file: ${e}` };
+        }
+      }
+      
+      case "file_edit": {
+        const { path, old_text, new_text } = args;
+        if (!path || !old_text || new_text === undefined) {
+          return { success: false, error: "Missing required parameters: path, old_text, new_text" };
+        }
+        try {
+          const content = await Deno.readTextFile(path);
+          if (!content.includes(old_text)) {
+            return { success: false, error: "Old text not found in file" };
+          }
+          const newContent = content.replace(old_text, new_text);
+          await Deno.writeTextFile(path, newContent);
+          return { success: true, result: `File edited successfully: ${path}` };
+        } catch (e) {
+          return { success: false, error: `Failed to edit file: ${e}` };
+        }
+      }
+      
+      case "file_delete": {
+        const { path } = args;
+        if (!path) return { success: false, error: "Missing required parameter: path" };
+        try {
+          await Deno.remove(path);
+          return { success: true, result: `File deleted: ${path}` };
+        } catch (e) {
+          return { success: false, error: `Failed to delete file: ${e}` };
+        }
+      }
+      
+      case "file_move": {
+        const { source, destination } = args;
+        if (!source || !destination) return { success: false, error: "Missing required parameters: source, destination" };
+        try {
+          await Deno.rename(source, destination);
+          return { success: true, result: `File moved: ${source} -> ${destination}` };
+        } catch (e) {
+          return { success: false, error: `Failed to move file: ${e}` };
+        }
+      }
+      
+      case "file_list": {
+        const { path = ".", recursive = false } = args;
+        try {
+          const items: string[] = [];
+          if (recursive) {
+            for await (const entry of Deno.readDir(path)) {
+              items.push(entry.name);
+              if (entry.isDirectory) {
+                try {
+                  for await (const subEntry of Deno.readDir(`${path}/${entry.name}`)) {
+                    items.push(`${entry.name}/${subEntry.name}`);
+                  }
+                } catch {}
+              }
+            }
+          } else {
+            for await (const entry of Deno.readDir(path)) {
+              items.push(entry.name);
+            }
+          }
+          return { success: true, result: items.join("\n") };
+        } catch (e) {
+          return { success: false, error: `Failed to list directory: ${e}` };
+        }
+      }
+      
+      case "file_search": {
+        const { pattern, path = ".", type = "all" } = args;
+        if (!pattern) return { success: false, error: "Missing required parameter: pattern" };
+        try {
+          const matches: string[] = [];
+          for await (const entry of Deno.readDir(path)) {
+            const regex = new RegExp(pattern.replace(/\*/g, ".*"));
+            if (regex.test(entry.name)) {
+              if (type === "all" || 
+                  (type === "file" && entry.isFile) || 
+                  (type === "directory" && entry.isDirectory)) {
+                matches.push(entry.name);
+              }
+            }
+          }
+          return { success: true, result: matches.length > 0 ? matches.join("\n") : "No matches found" };
+        } catch (e) {
+          return { success: false, error: `Failed to search files: ${e}` };
+        }
+      }
+      
+      case "directory_create": {
+        const { path } = args;
+        if (!path) return { success: false, error: "Missing required parameter: path" };
+        try {
+          await Deno.mkdir(path, { recursive: true });
+          return { success: true, result: `Directory created: ${path}` };
+        } catch (e) {
+          return { success: false, error: `Failed to create directory: ${e}` };
+        }
+      }
+      
+      case "directory_delete": {
+        const { path, recursive = false } = args;
+        if (!path) return { success: false, error: "Missing required parameter: path" };
+        try {
+          await Deno.remove(path, { recursive });
+          return { success: true, result: `Directory deleted: ${path}` };
+        } catch (e) {
+          return { success: false, error: `Failed to delete directory: ${e}` };
+        }
+      }
+      
+      case "search_files": {
+        const { pattern, path = ".", file_pattern, case_sensitive = false } = args;
+        if (!pattern) return { success: false, error: "Missing required parameter: pattern" };
+        try {
+          const cmd = new Deno.Command("grep", {
+            args: [
+              case_sensitive ? "" : "-i",
+              "-r",
+              pattern,
+              path
+            ].filter(Boolean),
+            stdout: "piped",
+            stderr: "piped"
+          });
+          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
+          const result = new TextDecoder().decode(stdout);
+          const error = new TextDecoder().decode(stderr);
+          if (!cmdSuccess && !result) {
+            return { success: false, error: error || "No matches found" };
+          }
+          return { success: true, result: result || "No matches found" };
+        } catch (e) {
+          return { success: false, error: `Failed to search: ${e}` };
+        }
+      }
+      
+      case "bash_execute": {
+        const { command, timeout = 30 } = args;
+        if (!command) return { success: false, error: "Missing required parameter: command" };
+        try {
+          const cmd = new Deno.Command("bash", {
+            args: ["-c", command],
+            stdout: "piped",
+            stderr: "piped"
+          });
+          const process = cmd.spawn();
+          
+          // 超时控制
+          const timeoutId = setTimeout(() => {
+            try { process.kill(); } catch {}
+          }, timeout * 1000);
+          
+          const { stdout, stderr, success: cmdSuccess } = await process.output();
+          clearTimeout(timeoutId);
+          
+          const result = new TextDecoder().decode(stdout);
+          const error = new TextDecoder().decode(stderr);
+          
+          return {
+            success: true,
+            result: JSON.stringify({
+              success: cmdSuccess,
+              stdout: result,
+              stderr: error,
+              exit_code: cmdSuccess ? 0 : 1
+            }, null, 2)
+          };
+        } catch (e) {
+          return { success: false, error: `Failed to execute command: ${e}` };
+        }
+      }
+      
+      case "get_working_directory": {
+        try {
+          const cwd = Deno.cwd();
+          return { success: true, result: cwd };
+        } catch (e) {
+          return { success: false, error: `Failed to get working directory: ${e}` };
+        }
+      }
+      
+      case "environment_info": {
+        const { include_env_vars = false } = args;
+        try {
+          const info: any = {
+            os: Deno.build.os,
+            arch: Deno.build.arch,
+            cwd: Deno.cwd()
+          };
+          if (include_env_vars) {
+            info.env = Deno.env.toObject();
+          }
+          return { success: true, result: JSON.stringify(info, null, 2) };
+        } catch (e) {
+          return { success: false, error: `Failed to get environment info: ${e}` };
+        }
+      }
+      
+      case "git_status": {
+        const { path = "." } = args;
+        try {
+          const cmd = new Deno.Command("git", {
+            args: ["-C", path, "status"],
+            stdout: "piped",
+            stderr: "piped"
+          });
+          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
+          const result = new TextDecoder().decode(stdout);
+          const error = new TextDecoder().decode(stderr);
+          if (!cmdSuccess) {
+            return { success: false, error: error || "Git command failed" };
+          }
+          return { success: true, result };
+        } catch (e) {
+          return { success: false, error: `Failed to get git status: ${e}` };
+        }
+      }
+      
+      case "git_diff": {
+        const { path = ".", staged = false, file } = args;
+        try {
+          const args_arr = ["-C", path, "diff"];
+          if (staged) args_arr.push("--staged");
+          if (file) args_arr.push(file);
+          
+          const cmd = new Deno.Command("git", {
+            args: args_arr,
+            stdout: "piped",
+            stderr: "piped"
+          });
+          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
+          const result = new TextDecoder().decode(stdout);
+          const error = new TextDecoder().decode(stderr);
+          if (!cmdSuccess && error) {
+            return { success: false, error };
+          }
+          return { success: true, result: result || "No changes" };
+        } catch (e) {
+          return { success: false, error: `Failed to get git diff: ${e}` };
+        }
+      }
+      
+      default:
+        return { success: false, error: `Unknown tool: ${toolName}` };
+    }
+  } catch (e) {
+    return { success: false, error: `Tool execution error: ${e}` };
+  }
+}
 
 // 加载初始数据
 if (storage) {
@@ -1911,6 +2395,11 @@ serve(async (req:Request): Promise<Response> => {
         tokens_count: TOKENS.length,
         current_token_index: getCurrentTokenIndex(),
                           total_token_calls: Atomics.load(rrView,0),
+                          storage_info: {
+                            chunks: Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE),
+                            chunk_size: TOKENS_CHUNK_SIZE,
+                            estimated_size_kb: Math.round((JSON.stringify(TOKENS).length / 1024) * 100) / 100
+                          },
                           features: {
                             long_context: CONFIG.enableLongContext,
                             thinking_injection: CONFIG.enableThinkingInjection,
@@ -2046,6 +2535,58 @@ serve(async (req:Request): Promise<Response> => {
     }
 
     /* 清空所有tokens - 需要管理员权限 */
+    if (path==="/v1/admin/tokens/export"){
+      if (!isAdminAuthorized(req)) {
+        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
+        return forbidden();
+      }
+
+      // GET: 导出所有完整tokens（不带掩码）
+      if (req.method==="GET"){
+        const url = new URL(req.url);
+        const format = url.searchParams.get("format") || "json"; // json, text, env
+        
+        log.warn({ 事件:"导出tokens", 请求ID:reqId, 数量: TOKENS.length, 格式: format });
+
+        if (format === "text") {
+          // 纯文本格式，每行一个token
+          const content = TOKENS.join("\n");
+          return new Response(content, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+              "Content-Disposition": 'attachment; filename="tokens.txt"',
+              "x-request-id": reqId
+            }
+          });
+        } else if (format === "env") {
+          // 环境变量格式
+          const content = `FLOWITH_AUTH_TOKENS=${TOKENS.join(",")}`;
+          return new Response(content, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+              "Content-Disposition": 'attachment; filename="tokens.env"',
+              "x-request-id": reqId
+            }
+          });
+        } else {
+          // JSON格式（默认）
+          return jsonResponse({
+            success: true,
+            tokens: TOKENS,
+            count: TOKENS.length,
+            exported_at: new Date().toISOString(),
+            format: "json"
+          }, 200, {
+            "Content-Disposition": 'attachment; filename="tokens.json"'
+          });
+        }
+      }
+
+      return badRequest("Only GET method is supported for this endpoint.");
+    }
+
     if (path==="/v1/admin/tokens/clear"){
       if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
@@ -2160,6 +2701,36 @@ serve(async (req:Request): Promise<Response> => {
 
       log.info({ 事件:"重置统计信息", 请求ID:reqId, 旧统计: oldStats });
       return jsonResponse({ success: true, message: "Statistics reset successfully", old_stats: oldStats });
+    }
+
+    /* 工具执行测试API - 需要管理员权限 */
+    if (path==="/v1/admin/tools/execute"){
+      if (!isAdminAuthorized(req)) {
+        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
+        return forbidden();
+      }
+
+      if (req.method==="POST"){
+        let body:any = {};
+        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
+        const { tool, arguments: args } = body;
+        
+        if (!tool || typeof tool !== "string") {
+          return badRequest("`tool` is required and must be a string.");
+        }
+        
+        log.info({ 事件:"测试工具执行", 请求ID:reqId, 工具: tool, 参数: args });
+        
+        const result = await executeToolCall(tool, args || {});
+        
+        return jsonResponse({
+          tool,
+          arguments: args,
+          execution: result
+        }, result.success ? 200 : 400);
+      }
+
+      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
 
     /* 配置管理API - 需要管理员权限 */
@@ -2602,11 +3173,18 @@ serve(async (req:Request): Promise<Response> => {
           log.debug({ 事件:"注入CLI模式提示词", 长度: CONFIG.cliPrompt.length, ...{ 请求ID: reqId } });
         }
         
-        // 3. MCP工具提示词
-        if (mcpTools && mcpTools.length > 0 && !CONFIG.enableCLIMode) {
-          const toolNames = mcpTools.map((t: any) => t.function.name).join(", ");
-          systemParts.push(`${CONFIG.mcpPrompt}\n\nAvailable tools: ${toolNames}`);
-          log.debug({ 事件:"注入MCP工具提示词", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
+        // 3. MCP工具提示词 + 工具调用格式
+        if (mcpTools && mcpTools.length > 0) {
+          if (CONFIG.enableCLIMode) {
+            // CLI模式：添加工具调用格式说明
+            systemParts.push(buildToolCallPrompt(mcpTools));
+            log.debug({ 事件:"注入CLI工具调用格式", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
+          } else {
+            // 普通MCP模式
+            const toolNames = mcpTools.map((t: any) => t.function.name).join(", ");
+            systemParts.push(`${CONFIG.mcpPrompt}\n\n${buildToolCallPrompt(mcpTools)}`);
+            log.debug({ 事件:"注入MCP工具提示词", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
+          }
         }
         
         // 4. 思考提示词
@@ -2777,10 +3355,29 @@ serve(async (req:Request): Promise<Response> => {
         isTimeoutError = false;
 
         try{
-          const result = await callUpstreamChat({
+          // ============ 工具代理模式检测 ============
+          const useToolProxy = !isExternalStream && mcpTools && mcpTools.length > 0 && CONFIG.enableCLIMode;
+          
+          let result;
+          if (useToolProxy) {
+            // 使用工具代理模式（自动执行工具调用）
+            log.info({ 事件:"启用工具代理模式", 工具数: mcpTools.length, ...logCtx });
+            result = await chatWithToolProxy({
+              reqId,
+              token: picked.token,
+              body: upstreamBody,
+              modelName,
+              mcpTools,
+              maxIterations: 5
+            });
+          } else {
+            // 普通模式（不自动执行工具）
+            result = await callUpstreamChat({
             reqId, token:picked.token, body: upstreamBody,
             forceStream: false, isExternalStream, modelName
           });
+          }
+          
           if (result.kind === "stream") {
             let idleTimer: number | undefined;
             let totalTimer: number | undefined;
@@ -3354,6 +3951,7 @@ log.info({
   TOKENS预览: TOKENS.slice(0, 3).map(mask),
          存储类型: STORAGE_TYPE,
          存储状态: storage !== null ? "已启用" : "未启用",
+         存储分片: storage !== null ? `${Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE)}片 (每片${TOKENS_CHUNK_SIZE}个)` : "N/A",
          同步模式: rsyncMode ? "完全同步(RSYNC=1)" : "差异同步",
          功能: {
            长上下文: CONFIG.enableLongContext,
