@@ -240,30 +240,88 @@ async function initStorage(): Promise<void> {
       console.log("[Storage] ✓ Memory storage initialized successfully");
     } else {
       // 默认使用 Deno KV
-      console.log(`[Storage] Initializing Deno KV${kvPath ? ` at ${kvPath}` : ""}...`);
-      const denoKv = await Deno.openKv(kvPath);
-      kv = denoKv; // 保留向后兼容
-      storage = new DenoKVAdapter(denoKv);
-      console.log(`[Storage] ✓ Deno KV initialized successfully`);
+      let denoKv: Deno.Kv | null = null;
+      
+      if (kvPath) {
+        // 尝试使用自定义路径
+        try {
+          console.log(`[Storage] Attempting Deno KV with custom path: ${kvPath}...`);
+          denoKv = await Deno.openKv(kvPath);
+          console.log(`[Storage] ✓ Deno KV initialized with custom path`);
+        } catch (kvPathErr) {
+          console.warn(`[Storage] Custom KV path failed: ${kvPathErr}`);
+          console.log("[Storage] Trying default Deno KV (no path)...");
+          // 降级到默认KV
+          try {
+            denoKv = await Deno.openKv();
+            console.log(`[Storage] ✓ Deno KV initialized (default)`);
+          } catch (defaultKvErr) {
+            console.warn(`[Storage] Default KV also failed: ${defaultKvErr}`);
+            throw new Error("Deno KV not available");
+          }
+        }
+      } else {
+        // 直接使用默认KV
+        console.log("[Storage] Initializing Deno KV (default)...");
+        denoKv = await Deno.openKv();
+        console.log(`[Storage] ✓ Deno KV initialized successfully`);
+      }
+      
+      if (denoKv) {
+        kv = denoKv; // 保留向后兼容
+        storage = new DenoKVAdapter(denoKv);
+      } else {
+        throw new Error("Failed to initialize Deno KV");
+      }
     }
     
     // 测试存储是否可用
-    await storage.set(["_health_check"], { ok: true, timestamp: Date.now() });
-    const healthCheck = await storage.get(["_health_check"]);
-    if (!healthCheck) {
-      throw new Error("Storage health check failed");
+    if (storage) {
+      await storage.set(["_health_check"], { ok: true, timestamp: Date.now() });
+      const healthCheck = await storage.get(["_health_check"]);
+      if (!healthCheck) {
+        throw new Error("Storage health check failed");
+      }
+      await storage.delete(["_health_check"]);
+      console.log("[Storage] Health check passed");
     }
-    await storage.delete(["_health_check"]);
-    console.log("[Storage] Health check passed");
     
   } catch (e) {
     console.error("[Storage] Initialization failed:", e);
-    console.log("[Storage] Falling back to memory storage...");
-    try {
-    storage = new MemoryAdapter();
-      console.log("[Storage] ✓ Fallback to memory storage successful");
-    } catch (fallbackErr) {
-      console.error("[Storage] Fallback failed:", fallbackErr);
+    
+    // 尝试降级策略
+    const fallbackStrategies = [
+      {
+        name: "SQLite",
+        init: async () => {
+          console.log(`[Storage] Trying SQLite fallback at ${sqlitePath}...`);
+          storage = new SQLiteAdapter(sqlitePath);
+        }
+      },
+      {
+        name: "Memory",
+        init: async () => {
+          console.log("[Storage] Trying memory storage fallback...");
+          storage = new MemoryAdapter();
+        }
+      }
+    ];
+    
+    let fallbackSuccess = false;
+    
+    for (const strategy of fallbackStrategies) {
+      try {
+        await strategy.init();
+        console.log(`[Storage] ✓ Fallback to ${strategy.name} storage successful`);
+        fallbackSuccess = true;
+        break;
+      } catch (fallbackErr) {
+        console.warn(`[Storage] ${strategy.name} fallback failed:`, fallbackErr);
+      }
+    }
+    
+    if (!fallbackSuccess) {
+      console.error("[Storage] All fallback strategies failed");
       console.error("[Storage] Running without persistent storage");
       storage = null;
     }
