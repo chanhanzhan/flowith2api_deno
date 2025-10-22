@@ -1252,97 +1252,68 @@ async function chatWithToolProxy(opts: {
   body: any;
   modelName: string;
   mcpTools: any[];
-  maxIterations?: number;
 }): Promise<{ kind: "nonstream"; status: number; content: string; headers: Headers; isEmpty?: boolean; isTruncated?: boolean; toolExecutions?: any[] }> {
-  const { reqId, token, body, modelName, mcpTools, maxIterations = 5 } = opts;
+  const { reqId, token, body, modelName, mcpTools } = opts;
   const logCtx = { 请求ID: reqId, 模型: modelName };
   
-  let conversation = [...body.messages];
-  const toolExecutions: any[] = [];
+  // 调用上游API（只调用一次）
+  const result = await callUpstreamChat({
+    reqId,
+    token,
+    body,
+    forceStream: false,
+    isExternalStream: false,
+    modelName
+  });
   
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
-    log.debug({ 事件: "工具代理循环", 迭代: iteration + 1, ...logCtx });
-    
-    // 调用上游API
-    const result = await callUpstreamChat({
-      reqId,
-      token,
-      body: { ...body, messages: conversation },
-      forceStream: false,
-      isExternalStream: false,
-      modelName
-    });
-    
-    if (result.kind === "stream") {
-      // 不应该发生，因为 forceStream=false
-      log.warn({ 事件: "工具代理收到流式响应", ...logCtx });
-      return { kind: "nonstream", status: 500, content: "Unexpected stream response", headers: new Headers(), toolExecutions };
-    }
-    
-    const { status, content, headers } = result;
-    
-    // 非2xx响应，直接返回
-    if (status < 200 || status >= 300) {
-      return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions };
-    }
-    
-    // 提取工具调用
-    const toolCalls = extractToolCalls(content);
-    
-    if (toolCalls.length === 0) {
-      // 没有工具调用，返回最终答案
-      log.info({ 事件: "工具代理完成", 迭代次数: iteration + 1, 工具执行次数: toolExecutions.length, ...logCtx });
-      return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions };
-    }
-    
-    // 执行所有工具调用
-    log.info({ 事件: "检测到工具调用", 工具数: toolCalls.length, 工具: toolCalls.map(t => t.name), ...logCtx });
-    
-    const results: any[] = [];
-    for (const call of toolCalls) {
-      const execution = await executeToolCall(call.name, call.arguments);
-      results.push({
-        tool: call.name,
-        arguments: call.arguments,
-        ...execution
-      });
-      toolExecutions.push({
-        iteration: iteration + 1,
-        tool: call.name,
-        arguments: call.arguments,
-        ...execution
-      });
-    }
-    
-    // 将AI响应添加到对话
-    conversation.push({
-      role: "assistant",
-      content: content
-    });
-    
-    // 将工具执行结果添加到对话
-    const toolResultsText = results.map((r, i) => 
-      `Tool: ${r.tool}\nSuccess: ${r.success}\nResult: ${r.success ? r.result : r.error}`
-    ).join("\n\n");
-    
-    conversation.push({
-      role: "user",
-      content: `Tool execution results:\n\n${toolResultsText}\n\nPlease continue based on these results. If you need more tools, use the same format. Otherwise, provide the final answer.`
-    });
-    
-    log.debug({ 事件: "工具结果已添加到对话", 结果数: results.length, ...logCtx });
+  if (result.kind === "stream") {
+    // 不应该发生，因为 forceStream=false
+    log.warn({ 事件: "工具代理收到流式响应", ...logCtx });
+    return { kind: "nonstream", status: 500, content: "Unexpected stream response", headers: new Headers(), toolExecutions: [] };
   }
   
-  // 达到最大迭代次数
-  log.warn({ 事件: "工具代理达到最大迭代", 迭代次数: maxIterations, ...logCtx });
-  return {
-    kind: "nonstream",
-    status: 200,
-    content: "Maximum tool execution iterations reached. Please simplify your request.",
-    headers: new Headers(),
-    isEmpty: false,
-    isTruncated: false,
-    toolExecutions
+  const { status, content, headers } = result;
+  
+  // 非2xx响应，直接返回
+  if (status < 200 || status >= 300) {
+    return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions: [] };
+  }
+  
+  // 提取工具调用
+  const toolCalls = extractToolCalls(content);
+  
+  if (toolCalls.length === 0) {
+    // 没有工具调用，直接返回
+    return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions: [] };
+  }
+  
+  // 执行所有工具调用
+  log.info({ 事件: "检测到工具调用", 工具数: toolCalls.length, 工具: toolCalls.map(t => t.name), ...logCtx });
+  
+  const toolExecutions: any[] = [];
+  for (const call of toolCalls) {
+    const execution = await executeToolCall(call.name, call.arguments);
+    toolExecutions.push({
+      tool: call.name,
+      arguments: call.arguments,
+      timestamp: new Date().toISOString(),
+      ...execution
+    });
+  }
+  
+  log.info({ 事件: "工具执行完成", 工具数: toolExecutions.length, 成功数: toolExecutions.filter(t => t.success).length, ...logCtx });
+  
+  // 返回原始AI响应 + 工具执行结果（不再循环）
+  // 客户端可以在响应的 toolExecutions 字段中看到所有执行结果
+  // 客户端可以自己决定是否继续对话
+  return { 
+    kind: "nonstream", 
+    status, 
+    content, 
+    headers, 
+    isEmpty: false, 
+    isTruncated: false, 
+    toolExecutions 
   };
 }
 
@@ -2229,7 +2200,7 @@ async function callUpstreamChat(opts: {
   forceStream?: boolean,
     isExternalStream: boolean,
     modelName: string
-}): Promise<{ kind:"stream", resp: Response } | { kind:"nonstream", status: number, content: string, headers: Headers, isEmpty?: boolean, isTruncated?: boolean }> {
+}): Promise<{ kind:"stream", resp: Response } | { kind:"nonstream", status: number, content: string, headers: Headers, isEmpty?: boolean, isTruncated?: boolean, toolExecutions?: any[] }> {
   const { reqId, token, body, forceStream=false, isExternalStream, modelName } = opts;
   const logCtx = { 请求ID:reqId, 模型: modelName, token: mask(token) };
 
@@ -3360,15 +3331,14 @@ serve(async (req:Request): Promise<Response> => {
           
           let result;
           if (useToolProxy) {
-            // 使用工具代理模式（自动执行工具调用）
+            // 使用工具代理模式（自动执行工具调用，不循环）
             log.info({ 事件:"启用工具代理模式", 工具数: mcpTools.length, ...logCtx });
             result = await chatWithToolProxy({
               reqId,
               token: picked.token,
               body: upstreamBody,
               modelName,
-              mcpTools,
-              maxIterations: 5
+              mcpTools
             });
           } else {
             // 普通模式（不自动执行工具）
@@ -3678,13 +3648,19 @@ serve(async (req:Request): Promise<Response> => {
                 // 解析失败，包装为标准格式
                 responseBody = openaiNonStream(modelName, content);
               }
+              
+              // 如果有工具执行结果，添加到响应中
+              if (result.toolExecutions && result.toolExecutions.length > 0) {
+                responseBody.tool_executions = result.toolExecutions;
+              }
 
               return new Response(
                 JSON.stringify(responseBody),
                                   { status, headers: {
                                     "content-type":"application/json",
                                     "x-request-id": reqId,
-                                    "x-retry-attempts": String(attempt + 1)
+                                    "x-retry-attempts": String(attempt + 1),
+                                    "x-tool-calls": result.toolExecutions && result.toolExecutions.length > 0 ? String(result.toolExecutions.length) : "0"
                                   }}
               );
             }
