@@ -44,6 +44,9 @@ interface AppConfig {
   enableLongContext: boolean;
   maxContextMessages: number;
   contextTTLSeconds: number;
+  // 系统提示词配置
+  enableSystemPrompt: boolean;
+  systemPrompt: string;
 }
 
 // 从环境变量加载配置
@@ -53,6 +56,35 @@ function loadConfigFromEnv(): AppConfig {
   const origin = flowithBase
     ? flowithBase.replace(/\/+$/, "")
     : (flowithRegion ? `https://${flowithRegion}.edge.flowith.net` : `https://edge.flowith.net`);
+
+  const defaultSystemPrompt = `When using tools, you MUST use the tool_use content block format, not text-based tool calls.
+
+CORRECT format (use this):
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll help you with that."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_unique_id",
+      "name": "tool_name",
+      "input": {
+        "parameter": "value"
+      }
+    }
+  ]
+}
+
+INCORRECT format (never use this):
+{
+  "role": "assistant",
+  "content": "I'll help you with that.\\n\\n<tool_call name=\\"tool_name\\">{...}</tool_call>"
+}
+
+Always use structured tool_use blocks, never embed tool calls in text strings.`;
 
   return {
     // tokens 不从这里加载，而是通过 syncTokensFromEnv() 统一管理
@@ -75,7 +107,9 @@ function loadConfigFromEnv(): AppConfig {
     retryOnStatus: [401, 403, 408,402, 409, 425, 429, 500, 502, 503, 504],
     enableLongContext: (Deno.env.get("ENABLE_LONG_CONTEXT") ?? "true").toLowerCase() === "true",
     maxContextMessages: Math.max(1, Number(Deno.env.get("MAX_CONTEXT_MESSAGES") ?? "20")),
-    contextTTLSeconds: Math.max(60, Number(Deno.env.get("CONTEXT_TTL_SECONDS") ?? "3600"))
+    contextTTLSeconds: Math.max(60, Number(Deno.env.get("CONTEXT_TTL_SECONDS") ?? "3600")),
+    enableSystemPrompt: (Deno.env.get("ENABLE_SYSTEM_PROMPT") ?? "true").toLowerCase() === "true",
+    systemPrompt: Deno.env.get("SYSTEM_PROMPT") ?? defaultSystemPrompt
   };
 }
 
@@ -653,6 +687,122 @@ function flattenContent(content:any):string{
   return String(content);
 }
 function normalizeMessages(messages:any[]){ return messages.map(m=>({ role:(m?.role ?? "user").toString(), content: flattenContent(m?.content) })); }
+
+// ============ 工具调用格式检测和转换 ============
+/**
+ * 检测字符串中是否包含错误的工具调用格式（<tool_call>标记）
+ */
+function hasIncorrectToolCallFormat(content: string): boolean {
+  return /<tool_call\s+name=["']([^"']+)["']\s*>/.test(content) || 
+         /<tool_call\s*>\s*{/.test(content);
+}
+
+/**
+ * 尝试将错误的工具调用格式转换为正确的 tool_use 格式
+ * 输入: "text <tool_call name=\"tool_name\">{\"param\":\"value\"}</tool_call>"
+ * 输出: { role: "assistant", content: [{type:"text",text:"text"},{type:"tool_use",id:"...",name:"tool_name",input:{...}}] }
+ */
+function convertToolCallFormat(content: string, modelName: string): any {
+  const toolCallPattern = /<tool_call(?:\s+name=["']([^"']+)["'])?\s*>([\s\S]*?)<\/tool_call>/g;
+  const matches = [...content.matchAll(toolCallPattern)];
+  
+  if (matches.length === 0) {
+    // 没有找到工具调用，返回原内容
+    return null;
+  }
+
+  const contentBlocks: any[] = [];
+  let lastIndex = 0;
+
+  for (const match of matches) {
+    const fullMatch = match[0];
+    const toolName = match[1];
+    const toolInput = match[2]?.trim() || "{}";
+    const matchIndex = match.index!;
+
+    // 添加工具调用前的文本（如果有）
+    if (matchIndex > lastIndex) {
+      const textBefore = content.slice(lastIndex, matchIndex).trim();
+      if (textBefore) {
+        contentBlocks.push({
+          type: "text",
+          text: textBefore
+        });
+      }
+    }
+
+    // 解析工具输入
+    let parsedInput: any = {};
+    try {
+      parsedInput = JSON.parse(toolInput);
+    } catch (e) {
+      // 如果解析失败，尝试提取 name 和参数
+      const nameMatch = toolInput.match(/["']?name["']?\s*:\s*["']([^"']+)["']/);
+      if (nameMatch && !toolName) {
+        // 从JSON中提取name
+        try {
+          parsedInput = JSON.parse(toolInput);
+        } catch {}
+      } else {
+        parsedInput = { raw: toolInput };
+      }
+    }
+
+    // 如果从 name 属性中提取，优先使用
+    const finalToolName = toolName || parsedInput.name || "unknown_tool";
+    
+    // 如果 parsedInput 中有 name 字段，移除它（因为会放在外层）
+    if (parsedInput.name) {
+      const { name, ...rest } = parsedInput;
+      parsedInput = rest;
+    }
+
+    // 添加 tool_use 块
+    contentBlocks.push({
+      type: "tool_use",
+      id: "toolu_" + crypto.randomUUID().replace(/-/g, "").slice(0, 20),
+      name: finalToolName,
+      input: parsedInput
+    });
+
+    lastIndex = matchIndex + fullMatch.length;
+  }
+
+  // 添加最后剩余的文本（如果有）
+  if (lastIndex < content.length) {
+    const textAfter = content.slice(lastIndex).trim();
+    if (textAfter) {
+      contentBlocks.push({
+        type: "text",
+        text: textAfter
+      });
+    }
+  }
+
+  // 如果没有文本块，添加一个空文本块
+  if (contentBlocks.length > 0 && contentBlocks.every((b: any) => b.type !== "text")) {
+    contentBlocks.unshift({
+      type: "text",
+      text: "I'll help you with that."
+    });
+  }
+
+  return {
+    id: "chatcmpl_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelName,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: contentBlocks
+      },
+      finish_reason: "tool_calls"
+    }],
+    usage: null
+  };
+}
 function extractDeltaFromTextChunk(raw: string): { delta: string; isFinal: boolean } {
   let s = (raw ?? "").trim();
   if (!s) return { delta: "", isFinal: false };
@@ -993,11 +1143,14 @@ serve(async (req:Request): Promise<Response> => {
                           total_token_calls: Atomics.load(rrView,0),
                           features: {
                             long_context: CONFIG.enableLongContext,
+                            system_prompt: CONFIG.enableSystemPrompt,
                             deno_kv: USE_KV && kv !== null
                           },
                           config: {
                             max_context_messages: CONFIG.maxContextMessages,
                             context_ttl_seconds: CONFIG.contextTTLSeconds,
+                            system_prompt_enabled: CONFIG.enableSystemPrompt,
+                            system_prompt_length: CONFIG.systemPrompt.length,
                             sse_retry_on_empty: CONFIG.sseRetryOnEmpty,
                             sse_min_content_length: CONFIG.sseMinContentLength
                           },
@@ -1399,6 +1552,25 @@ serve(async (req:Request): Promise<Response> => {
         }
       }
 
+      // ============ 系统提示词注入（引导正确使用工具） ============
+      if (CONFIG.enableSystemPrompt && normMessages.length > 0 && tools && tools.length > 0) {
+        // 检查是否已有system消息
+        const firstSystemIdx = normMessages.findIndex(m => m.role === "system");
+        
+        if (firstSystemIdx === -1) {
+          // 如果没有system消息，在最前面添加
+          normMessages.unshift({
+            role: "system",
+            content: CONFIG.systemPrompt
+          });
+          log.debug({ 事件:"注入系统提示词", 类型: "前置", 长度: CONFIG.systemPrompt.length, ...{ 请求ID: reqId } });
+        } else {
+          // 如果已有system消息，追加到第一个system消息的内容后
+          normMessages[firstSystemIdx].content += "\n\n" + CONFIG.systemPrompt;
+          log.debug({ 事件:"注入系统提示词", 类型: "追加", 长度: CONFIG.systemPrompt.length, ...{ 请求ID: reqId } });
+        }
+      }
+
       const isExternalStream = !!stream;
       const maxTok = Number.isFinite(max_completion_tokens) ? max_completion_tokens
       : Number.isFinite(max_tokens) ? max_tokens : undefined;
@@ -1487,11 +1659,64 @@ serve(async (req:Request): Promise<Response> => {
                     controller.close(); return;
                 }
                 const reader = body.getReader();
-                const send = (obj:any)=> controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
                 let buf = "";
+                let fullContent = ""; // 收集完整内容用于检测错误格式
+                let hasDetectedError = false;
+                
                 const safeClose = () => {
                   if (readerClosed) return;
                   readerClosed = true;
+                  
+                  // 在关闭前检查是否有错误格式的工具调用
+                  if (!hasDetectedError && fullContent && hasIncorrectToolCallFormat(fullContent)) {
+                    log.warn({ 
+                      事件:"流式响应检测到错误格式", 
+                      内容预览: fullContent.slice(0, 200),
+                      ...logCtx 
+                    });
+                    hasDetectedError = true;
+                    
+                    // 尝试转换格式
+                    const converted = convertToolCallFormat(fullContent, modelName);
+                    if (converted && converted.choices[0].message.content) {
+                      log.info({ 
+                        事件:"流式响应转换工具调用格式", 
+                        工具数: converted.choices[0].message.content.filter((b: any) => b.type === "tool_use").length,
+                        ...logCtx 
+                      });
+                      
+                      // 发送转换后的内容块
+                      for (const block of converted.choices[0].message.content) {
+                        if (block.type === "text") {
+                          controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, block.text))}\n\n`));
+                        } else if (block.type === "tool_use") {
+                          // 将 tool_use 作为特殊的 delta 发送
+                          const toolChunk = {
+                            id: "chatcmpl_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10),
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: modelName,
+                            choices: [{
+                              index: 0,
+                              delta: {
+                                tool_calls: [{
+                                  id: block.id,
+                                  type: "function",
+                                  function: {
+                                    name: block.name,
+                                    arguments: JSON.stringify(block.input)
+                                  }
+                                }]
+                              },
+                              finish_reason: null
+                            }]
+                          };
+                          controller.enqueue(enc.encode(`data: ${JSON.stringify(toolChunk)}\n\n`));
+                        }
+                      }
+                    }
+                  }
+                  
                   const doneObj = { id:"done", object:"chat.completion.chunk",
                     choices:[{ index:0, delta:{}, finish_reason:"stop"}],
                     created: Math.floor(Date.now()/1000), model: modelName };
@@ -1544,11 +1769,31 @@ serve(async (req:Request): Promise<Response> => {
                           const delta = typeof obj?.content === "string"
                           ? obj.content
                           : (obj?.tag === "final" ? String(obj.content ?? "") : "");
-                          if (delta) controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
+                          if (delta) {
+                            fullContent += delta; // 累积内容用于格式检测
+                            // 检查是否包含错误格式
+                            if (!hasDetectedError && hasIncorrectToolCallFormat(delta)) {
+                              hasDetectedError = true;
+                              log.warn({ 事件:"流中检测到错误格式", delta预览: delta.slice(0, 100), ...logCtx });
+                            }
+                            // 如果还没检测到错误，正常发送
+                            if (!hasDetectedError) {
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
+                            }
+                          }
                           if (obj?.tag === "final") { safeClose(); return; }
                         }catch{
                           const { delta, isFinal } = extractDeltaFromTextChunk(data);
-                          if (delta) controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
+                          if (delta) {
+                            fullContent += delta; // 累积内容
+                            if (!hasDetectedError && hasIncorrectToolCallFormat(delta)) {
+                              hasDetectedError = true;
+                              log.warn({ 事件:"流中检测到错误格式", delta预览: delta.slice(0, 100), ...logCtx });
+                            }
+                            if (!hasDetectedError) {
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
+                            }
+                          }
                           if (isFinal) { safeClose(); return; }
                         }
                       }
@@ -1632,14 +1877,40 @@ serve(async (req:Request): Promise<Response> => {
                 await saveStatsToKV();
               }
               
-              // 透传上游的错误状态和内容
+              // ============ 检查并转换错误的工具调用格式 ============
               let responseBody;
-              try {
-                // 尝试解析为 JSON（上游可能返回结构化错误）
-                responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
-              } catch {
-                // 解析失败，包装为标准格式
-                responseBody = openaiNonStream(modelName, content);
+              if (status >= 200 && status < 300 && content && hasIncorrectToolCallFormat(content)) {
+                log.warn({ 
+                  事件:"检测到错误的工具调用格式", 
+                  内容预览: content.slice(0, 200),
+                  ...logCtx 
+                });
+                
+                const converted = convertToolCallFormat(content, modelName);
+                if (converted) {
+                  log.info({ 
+                    事件:"已转换工具调用格式", 
+                    工具数: converted.choices[0].message.content.filter((b: any) => b.type === "tool_use").length,
+                    ...logCtx 
+                  });
+                  responseBody = converted;
+                } else {
+                  // 转换失败，使用原内容
+                  try {
+                    responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
+                  } catch {
+                    responseBody = openaiNonStream(modelName, content);
+                  }
+                }
+              } else {
+                // 透传上游的错误状态和内容
+                try {
+                  // 尝试解析为 JSON（上游可能返回结构化错误）
+                  responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
+                } catch {
+                  // 解析失败，包装为标准格式
+                  responseBody = openaiNonStream(modelName, content);
+                }
               }
               
             return new Response(
@@ -1769,6 +2040,7 @@ log.info({
   KV存储: USE_KV && kv !== null ? "已启用" : "未启用",
   同步模式: rsyncMode ? "完全同步(RSYNC=1)" : "差异同步",
   功能: {
-    长上下文: CONFIG.enableLongContext
+    长上下文: CONFIG.enableLongContext,
+    系统提示词: CONFIG.enableSystemPrompt
   }
 });
