@@ -1,334 +1,20 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { DB } from "https://deno.land/x/sqlite/mod.ts";
 
-// ============ 存储抽象层 ============
-interface StorageAdapter {
-  get<T>(key: string[]): Promise<T | null>;
-  set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void>;
-  delete(key: string[]): Promise<void>;
-  close(): Promise<void>;
-}
+// ============ Deno KV 配置 ============
+const USE_KV = (Deno.env.get("USE_DENO_KV") ?? "true").toLowerCase() === "true";
+const KV_PATH = Deno.env.get("DENO_KV_PATH"); // 可选：自定义 KV 数据库路径
+let kv: Deno.Kv | null = null;
 
-// SQLite 存储适配器
-class SQLiteAdapter implements StorageAdapter {
-  private db: DB;
-  private cleanupTimer?: number;
-  private isClosed = false;
-
-  constructor(path: string) {
-    try {
-    this.db = new DB(path);
-    this.db.execute(`
-    CREATE TABLE IF NOT EXISTS kv_store (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-        expire_at INTEGER,
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
-        updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-    )
-    `);
-    this.db.execute(`CREATE INDEX IF NOT EXISTS idx_expire ON kv_store(expire_at)`);
-      this.db.execute(`CREATE INDEX IF NOT EXISTS idx_created ON kv_store(created_at)`);
-      
-    // 定期清理过期数据
-      this.cleanupTimer = setInterval(() => this.cleanup(), 60000) as unknown as number;
-      
-      console.log(`[SQLite] Adapter initialized at ${path}`);
-    } catch (e) {
-      console.error("[SQLite] Initialization error:", e);
-      throw e;
-    }
-  }
-
-  private cleanup() {
-    if (this.isClosed) return;
-    
-    try {
-      const now = Date.now();
-      const result = this.db.query("DELETE FROM kv_store WHERE expire_at IS NOT NULL AND expire_at < ?", [now]);
-      if (result && result.length > 0) {
-        console.log(`[SQLite] Cleaned up expired entries`);
-      }
-    } catch (e) {
-      console.error("[SQLite] Cleanup error:", e);
-    }
-  }
-
-  async get<T>(key: string[]): Promise<T | null> {
-    if (this.isClosed) {
-      console.warn("[SQLite] Attempted to get from closed database");
-      return null;
-    }
-    
-    try {
-    const keyStr = JSON.stringify(key);
-    const now = Date.now();
-    const rows = this.db.query("SELECT value FROM kv_store WHERE key = ? AND (expire_at IS NULL OR expire_at > ?)", [keyStr, now]);
-
-    if (rows.length === 0) return null;
-
-    try {
-      return JSON.parse(rows[0][0] as string) as T;
-      } catch (e) {
-        console.error("[SQLite] JSON parse error:", e);
-        return null;
-      }
-    } catch (e) {
-      console.error("[SQLite] Get error:", e);
-      return null;
-    }
-  }
-
-  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
-    if (this.isClosed) {
-      console.warn("[SQLite] Attempted to set on closed database");
-      return;
-    }
-    
-    try {
-    const keyStr = JSON.stringify(key);
-    const valueStr = JSON.stringify(value);
-    const expireAt = options?.expireIn ? Date.now() + options.expireIn : null;
-      const now = Date.now();
-
-    this.db.query(
-        "INSERT OR REPLACE INTO kv_store (key, value, expire_at, updated_at) VALUES (?, ?, ?, ?)",
-                    [keyStr, valueStr, expireAt, now]
-    );
-    } catch (e) {
-      console.error("[SQLite] Set error:", e);
-      throw e;
-    }
-  }
-
-  async delete(key: string[]): Promise<void> {
-    if (this.isClosed) {
-      console.warn("[SQLite] Attempted to delete from closed database");
-      return;
-    }
-    
-    try {
-    const keyStr = JSON.stringify(key);
-    this.db.query("DELETE FROM kv_store WHERE key = ?", [keyStr]);
-    } catch (e) {
-      console.error("[SQLite] Delete error:", e);
-      throw e;
-    }
-  }
-
-  async close(): Promise<void> {
-    if (this.isClosed) return;
-    
-    this.isClosed = true;
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-    }
-    
-    try {
-    this.db.close();
-      console.log("[SQLite] Database closed");
-    } catch (e) {
-      console.error("[SQLite] Close error:", e);
-    }
-  }
-}
-
-// Deno KV 存储适配器
-class DenoKVAdapter implements StorageAdapter {
-  constructor(private kv: Deno.Kv) {}
-
-  async get<T>(key: string[]): Promise<T | null> {
-    const result = await this.kv.get<T>(key);
-    return result.value;
-  }
-
-  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
-    await this.kv.set(key, value, options);
-  }
-
-  async delete(key: string[]): Promise<void> {
-    await this.kv.delete(key);
-  }
-
-  async close(): Promise<void> {
-    this.kv.close();
-  }
-}
-
-// 内存存储适配器
-class MemoryAdapter implements StorageAdapter {
-  private store = new Map<string, { value: any; expireAt?: number }>();
-
-  constructor() {
-    setInterval(() => this.cleanup(), 60000);
-  }
-
-  private cleanup() {
-    const now = Date.now();
-    for (const [key, entry] of this.store.entries()) {
-      if (entry.expireAt && entry.expireAt < now) {
-        this.store.delete(key);
-      }
-    }
-  }
-
-  async get<T>(key: string[]): Promise<T | null> {
-    const keyStr = JSON.stringify(key);
-    const entry = this.store.get(keyStr);
-
-    if (!entry) return null;
-    if (entry.expireAt && entry.expireAt < Date.now()) {
-      this.store.delete(keyStr);
-      return null;
-    }
-
-    return entry.value as T;
-  }
-
-  async set<T>(key: string[], value: T, options?: { expireIn?: number }): Promise<void> {
-    const keyStr = JSON.stringify(key);
-    const expireAt = options?.expireIn ? Date.now() + options.expireIn : undefined;
-    this.store.set(keyStr, { value, expireAt });
-  }
-
-  async delete(key: string[]): Promise<void> {
-    const keyStr = JSON.stringify(key);
-    this.store.delete(keyStr);
-  }
-
-  async close(): Promise<void> {
-    this.store.clear();
-  }
-}
-
-// ============ 环境变量加载（支持非Deno环境）============
-function getEnv(key: string, defaultValue: string = ""): string {
+// 初始化 Deno KV
+if (USE_KV) {
   try {
-    // 优先使用 Deno.env
-    return Deno.env.get(key) ?? defaultValue;
-  } catch {
-    // 兜底：尝试使用 globalThis 访问 process.env (Node.js环境)
-    try {
-      const proc = (globalThis as any).process;
-      if (proc && proc.env && proc.env[key]) {
-        return proc.env[key];
-      }
-    } catch {
-      // 忽略错误
-    }
-    return defaultValue;
-  }
-}
-
-// ============ 存储初始化 ============
-const STORAGE_TYPE = getEnv("STORAGE_TYPE", "kv").toLowerCase();
-let storage: StorageAdapter | null = null;
-let kv: Deno.Kv | null = null; // 保留向后兼容
-
-async function initStorage(): Promise<void> {
-  const kvPath = getEnv("DENO_KV_PATH");
-  const sqlitePath = getEnv("SQLITE_PATH") || getEnv("DATA_PATH") || "./data/flowith.db";
-
-  try {
-    if (STORAGE_TYPE === "sqlite") {
-      console.log(`[Storage] Initializing SQLite at ${sqlitePath}...`);
-      storage = new SQLiteAdapter(sqlitePath);
-      console.log(`[Storage] ✓ SQLite initialized successfully`);
-    } else if (STORAGE_TYPE === "memory") {
-      console.log("[Storage] Initializing memory storage...");
-      storage = new MemoryAdapter();
-      console.log("[Storage] ✓ Memory storage initialized successfully");
-    } else {
-      // 默认使用 Deno KV
-      let denoKv: Deno.Kv | null = null;
-      
-      if (kvPath) {
-        // 尝试使用自定义路径
-        try {
-          console.log(`[Storage] Attempting Deno KV with custom path: ${kvPath}...`);
-          denoKv = await Deno.openKv(kvPath);
-          console.log(`[Storage] ✓ Deno KV initialized with custom path`);
-        } catch (kvPathErr) {
-          console.warn(`[Storage] Custom KV path failed: ${kvPathErr}`);
-          console.log("[Storage] Trying default Deno KV (no path)...");
-          // 降级到默认KV
-          try {
-            denoKv = await Deno.openKv();
-            console.log(`[Storage] ✓ Deno KV initialized (default)`);
-          } catch (defaultKvErr) {
-            console.warn(`[Storage] Default KV also failed: ${defaultKvErr}`);
-            throw new Error("Deno KV not available");
-          }
-        }
-      } else {
-        // 直接使用默认KV
-        console.log("[Storage] Initializing Deno KV (default)...");
-        denoKv = await Deno.openKv();
-        console.log(`[Storage] ✓ Deno KV initialized successfully`);
-      }
-      
-      if (denoKv) {
-      kv = denoKv; // 保留向后兼容
-      storage = new DenoKVAdapter(denoKv);
-      } else {
-        throw new Error("Failed to initialize Deno KV");
-      }
-    }
-    
-    // 测试存储是否可用
-    if (storage) {
-      await storage.set(["_health_check"], { ok: true, timestamp: Date.now() });
-      const healthCheck = await storage.get(["_health_check"]);
-      if (!healthCheck) {
-        throw new Error("Storage health check failed");
-      }
-      await storage.delete(["_health_check"]);
-      console.log("[Storage] Health check passed");
-    }
-    
+    kv = await Deno.openKv(KV_PATH);
+    console.log(`[KV] Deno KV initialized${KV_PATH ? ` at ${KV_PATH}` : ""}`);
   } catch (e) {
-    console.error("[Storage] Initialization failed:", e);
-    
-    // 尝试降级策略
-    const fallbackStrategies = [
-      {
-        name: "SQLite",
-        init: async () => {
-          console.log(`[Storage] Trying SQLite fallback at ${sqlitePath}...`);
-          storage = new SQLiteAdapter(sqlitePath);
-        }
-      },
-      {
-        name: "Memory",
-        init: async () => {
-          console.log("[Storage] Trying memory storage fallback...");
-    storage = new MemoryAdapter();
-        }
-      }
-    ];
-    
-    let fallbackSuccess = false;
-    
-    for (const strategy of fallbackStrategies) {
-      try {
-        await strategy.init();
-        console.log(`[Storage] ✓ Fallback to ${strategy.name} storage successful`);
-        fallbackSuccess = true;
-        break;
-      } catch (fallbackErr) {
-        console.warn(`[Storage] ${strategy.name} fallback failed:`, fallbackErr);
-      }
-    }
-    
-    if (!fallbackSuccess) {
-      console.error("[Storage] All fallback strategies failed");
-      console.error("[Storage] Running without persistent storage");
-      storage = null;
-    }
+    console.error("[KV] Failed to initialize Deno KV:", e);
+    console.log("[KV] Falling back to in-memory storage");
   }
 }
-
-await initStorage();
 
 // ============ 配置管理系统 ============
 interface AppConfig {
@@ -343,8 +29,6 @@ interface AppConfig {
   flowithBase: string;
   flowithRegion: string;
   origin: string;
-  // 代理配置
-  proxyUrl?: string;
   // 超时配置
   headerTimeoutMs: number;
   bodyTimeoutMs: number;
@@ -356,121 +40,104 @@ interface AppConfig {
   sseRetryOnEmpty: boolean;
   sseMinContentLength: number;
   retryOnStatus: number[];
-  noRetryOnTimeout: boolean;
   // 长上下文配置
   enableLongContext: boolean;
   maxContextMessages: number;
   contextTTLSeconds: number;
-  // 思考注入配置
-  enableThinkingInjection: boolean;
-  thinkingPrompt: string;
   // 系统提示词配置
-  systemPrompt?: string;
-  enableSystemPromptOverride: boolean;
-  // MCP配置
-  enableMCP: boolean;
-  mcpTools: string[];
-  mcpPrompt: string;
-  // CLI模式配置
-  enableCLIMode: boolean;
-  cliPrompt: string;
-  // 存储配置
-  storageType: "kv" | "sqlite" | "memory";
-  sqlitePath?: string;
-  // 仅服务端模式
-  serverOnly: boolean;
-  // Claude API 兼容
-  enableClaudeAPI: boolean;
-  // 思考功能增强
-  enableThinkingTags: boolean;
-  thinkingTagFormat: "xml" | "markdown" | "custom";
-  thinkingStartTag: string;
-  thinkingEndTag: string;
-  // 性能优化
-  enableStreamOptimization: boolean;
+  enableSystemPrompt: boolean;
+  systemPrompt: string;
 }
 
 // 从环境变量加载配置
 function loadConfigFromEnv(): AppConfig {
-  const flowithBase = getEnv("FLOWITH_BASE").trim();
-  const flowithRegion = getEnv("FLOWITH_REGION").trim();
+  const flowithBase = (Deno.env.get("FLOWITH_BASE") ?? "").trim();
+  const flowithRegion = (Deno.env.get("FLOWITH_REGION") ?? "").trim();
   const origin = flowithBase
-  ? flowithBase.replace(/\/+$/, "")
-  : (flowithRegion ? `https://${flowithRegion}.edge.flowith.net` : `https://edge.flowith.net`);
+    ? flowithBase.replace(/\/+$/, "")
+    : (flowithRegion ? `https://${flowithRegion}.edge.flowith.net` : `https://edge.flowith.net`);
 
-  const storageTypeEnv = getEnv("STORAGE_TYPE", "kv").toLowerCase();
-  const storageType = (storageTypeEnv === "sqlite" || storageTypeEnv === "memory") ? storageTypeEnv : "kv";
+  const defaultSystemPrompt = `When using tools, you MUST use the tool_use content block format, not text-based tool calls.
+
+CORRECT format (use this):
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll help you with that."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_unique_id",
+      "name": "tool_name",
+      "input": {
+        "parameter": "value"
+      }
+    }
+  ]
+}
+
+INCORRECT format (never use this):
+{
+  "role": "assistant",
+  "content": "I'll help you with that.\\n\\n<tool_call name=\\"tool_name\\">{...}</tool_call>"
+}
+
+Always use structured tool_use blocks, never embed tool calls in text strings.`;
 
   return {
     // tokens 不从这里加载，而是通过 syncTokensFromEnv() 统一管理
     tokens: [],
-    apiKeys: getEnv("API_KEYS").split(",").map(s => s.trim()).filter(Boolean),
-    adminKey: getEnv("ADMIN_KEY") || (getEnv("API_KEYS").split(",")[0]?.trim() ?? ""),
-    port: Number(getEnv("PORT", "8787")),
-    logLevel: getEnv("LOG_LEVEL", "info").toLowerCase(),
+    apiKeys: (Deno.env.get("API_KEYS") ?? "").split(",").map(s => s.trim()).filter(Boolean),
+    adminKey: (Deno.env.get("ADMIN_KEY") ?? Deno.env.get("API_KEYS") ?? "").split(",")[0]?.trim() ?? "",
+    port: Number(Deno.env.get("PORT") ?? "8787"),
+    logLevel: (Deno.env.get("LOG_LEVEL") ?? "info").toLowerCase(),
     flowithBase,
     flowithRegion,
     origin,
-    proxyUrl: getEnv("PROXY_URL") || undefined,
-    headerTimeoutMs: Math.max(1000, Number(getEnv("UPSTREAM_TIMEOUT_MS", "25000"))),
-    bodyTimeoutMs: Math.max(2000, Number(getEnv("UPSTREAM_BODY_TIMEOUT_MS", "30000"))),
-    streamIdleTimeoutMs: Math.max(2000, Number(getEnv("STREAM_IDLE_TIMEOUT_MS", "15000"))),
-    streamTotalTimeoutMs: Math.max(5000, Number(getEnv("STREAM_TOTAL_TIMEOUT_MS", "180000"))),
-    retryMax: Math.max(0, Number(getEnv("UPSTREAM_RETRY_MAX", "3"))),
-    retryBackoffBaseMs: Math.max(0, Number(getEnv("UPSTREAM_RETRY_BACKOFF_MS", "200"))),
-    sseRetryOnEmpty: getEnv("SSE_RETRY_ON_EMPTY", "true").toLowerCase() === "true",
-    sseMinContentLength: Math.max(0, Number(getEnv("SSE_MIN_CONTENT_LENGTH", "10"))),
-    retryOnStatus: [401, 403, 408, 402, 409, 425, 429, 500, 502, 503, 504],
-    noRetryOnTimeout: getEnv("NO_RETRY_ON_TIMEOUT", "true").toLowerCase() === "true",
-    enableLongContext: getEnv("ENABLE_LONG_CONTEXT", "true").toLowerCase() === "true",
-    maxContextMessages: Math.max(1, Number(getEnv("MAX_CONTEXT_MESSAGES", "20"))),
-    contextTTLSeconds: Math.max(60, Number(getEnv("CONTEXT_TTL_SECONDS", "3600"))),
-    enableThinkingInjection: getEnv("ENABLE_THINKING_INJECTION", "true").toLowerCase() === "true",
-    thinkingPrompt: getEnv("THINKING_PROMPT", "Please think step by step before answering."),
-    systemPrompt: getEnv("SYSTEM_PROMPT") || undefined,
-    enableSystemPromptOverride: getEnv("ENABLE_SYSTEM_PROMPT_OVERRIDE", "false").toLowerCase() === "true",
-    enableMCP: getEnv("ENABLE_MCP", "true").toLowerCase() === "true",
-    mcpTools: getEnv("MCP_TOOLS", "").split(",").map(s => s.trim()).filter(Boolean),
-    mcpPrompt: getEnv("MCP_PROMPT", "You have access to the following tools. Use them when appropriate to provide better assistance."),
-    enableCLIMode: getEnv("ENABLE_CLI_MODE", "false").toLowerCase() === "true",
-    cliPrompt: getEnv("CLI_PROMPT", "You are an AI assistant with full access to the filesystem and command-line tools. You can read, write, edit files, execute commands, and manage the development environment. Always confirm before making destructive operations."),
-    storageType: storageType as "kv" | "sqlite" | "memory",
-    sqlitePath: getEnv("SQLITE_PATH") || getEnv("DATA_PATH") || "./data/flowith.db",
-    serverOnly: getEnv("SERVER_ONLY", "false").toLowerCase() === "true",
-    enableClaudeAPI: getEnv("ENABLE_CLAUDE_API", "true").toLowerCase() === "true",
-    enableThinkingTags: getEnv("ENABLE_THINKING_TAGS", "true").toLowerCase() === "true",
-    thinkingTagFormat: (getEnv("THINKING_TAG_FORMAT", "xml")) as "xml" | "markdown" | "custom",
-    thinkingStartTag: getEnv("THINKING_START_TAG", "<thinking>"),
-    thinkingEndTag: getEnv("THINKING_END_TAG", "</thinking>"),
-    enableStreamOptimization: getEnv("ENABLE_STREAM_OPTIMIZATION", "true").toLowerCase() === "true"
+    headerTimeoutMs: Math.max(1000, Number(Deno.env.get("UPSTREAM_TIMEOUT_MS") ?? "25000")),
+    bodyTimeoutMs: Math.max(2000, Number(Deno.env.get("UPSTREAM_BODY_TIMEOUT_MS") ?? "30000")),
+    streamIdleTimeoutMs: Math.max(2000, Number(Deno.env.get("STREAM_IDLE_TIMEOUT_MS") ?? "15000")),
+    streamTotalTimeoutMs: Math.max(5000, Number(Deno.env.get("STREAM_TOTAL_TIMEOUT_MS") ?? "180000")),
+    retryMax: Math.max(0, Number(Deno.env.get("UPSTREAM_RETRY_MAX") ?? "3")),
+    retryBackoffBaseMs: Math.max(0, Number(Deno.env.get("UPSTREAM_RETRY_BACKOFF_MS") ?? "200")),
+    sseRetryOnEmpty: (Deno.env.get("SSE_RETRY_ON_EMPTY") ?? "true").toLowerCase() === "true",
+    sseMinContentLength: Math.max(0, Number(Deno.env.get("SSE_MIN_CONTENT_LENGTH") ?? "10")),
+    retryOnStatus: [401, 403, 408,402, 409, 425, 429, 500, 502, 503, 504],
+    enableLongContext: (Deno.env.get("ENABLE_LONG_CONTEXT") ?? "true").toLowerCase() === "true",
+    maxContextMessages: Math.max(1, Number(Deno.env.get("MAX_CONTEXT_MESSAGES") ?? "20")),
+    contextTTLSeconds: Math.max(60, Number(Deno.env.get("CONTEXT_TTL_SECONDS") ?? "3600")),
+    enableSystemPrompt: (Deno.env.get("ENABLE_SYSTEM_PROMPT") ?? "true").toLowerCase() === "true",
+    systemPrompt: Deno.env.get("SYSTEM_PROMPT") ?? defaultSystemPrompt
   };
 }
 
 // 全局配置对象
 let CONFIG = loadConfigFromEnv();
 
-// 保存配置到存储
-async function saveConfigToStorage(): Promise<void> {
-  if (!storage) return;
+// 保存配置到KV
+async function saveConfigToKV(): Promise<void> {
+  if (!kv) return;
   try {
-    await storage.set(["config"], CONFIG);
-    console.log("[Storage] Configuration saved");
+    await kv.set(["config"], CONFIG);
+    console.log("[KV] Configuration saved to KV");
   } catch (e) {
-    console.error("[Storage] Failed to save config:", e);
+    console.error("[KV] Failed to save config:", e);
   }
 }
 
-// 从存储加载配置
-async function loadConfigFromStorage(): Promise<void> {
-  if (!storage) return;
+// 从KV加载配置
+async function loadConfigFromKV(): Promise<void> {
+  if (!kv) return;
   try {
-    const value = await storage.get<AppConfig>(["config"]);
-    if (value) {
-      CONFIG = { ...CONFIG, ...value };
-      console.log("[Storage] Configuration loaded");
+    const result = await kv.get<AppConfig>(["config"]);
+    if (result.value) {
+      CONFIG = { ...CONFIG, ...result.value };
+      console.log("[KV] Configuration loaded from KV");
     }
   } catch (e) {
-    console.error("[Storage] Failed to load config:", e);
+    console.error("[KV] Failed to load config:", e);
   }
 }
 
@@ -505,124 +172,66 @@ const log = {
   warn :(o:any)=>logAt("warn",o),
   error:(o:any)=>logAt("error",o),
 };
-// ============ 数据操作函数 ============
-// Token分片大小（每个分片最多存储的token数量）
-// Deno KV单个值最大64KB，保守起见每片存储50个token
-const TOKENS_CHUNK_SIZE = 50;
-
-async function loadTokensFromStorage(): Promise<void> {
-  if (!storage) return;
+// ============ KV 数据操作函数 ============
+async function loadTokensFromKV(): Promise<void> {
+  if (!kv) return;
   try {
-    // 先尝试加载元数据
-    const meta = await storage.get<{ total: number; chunks: number }>(["tokens_meta"]);
-    
-    if (meta && meta.chunks > 0) {
-      // 从分片加载
+    const result = await kv.get<string[]>(["tokens"]);
+    if (result.value && Array.isArray(result.value)) {
       TOKENS.length = 0;
-      for (let i = 0; i < meta.chunks; i++) {
-        const chunk = await storage.get<string[]>(["tokens_chunk", String(i)]);
-        if (chunk && Array.isArray(chunk)) {
-          TOKENS.push(...chunk);
-        }
-      }
-      console.log(`[Storage] Loaded ${TOKENS.length} tokens from ${meta.chunks} chunk(s)`);
-    } else {
-      // 尝试加载旧格式（兼容性）
-    const value = await storage.get<string[]>(["tokens"]);
-    if (value && Array.isArray(value)) {
-      TOKENS.length = 0;
-      TOKENS.push(...value);
-        console.log(`[Storage] Loaded ${TOKENS.length} tokens (legacy format)`);
-        // 转换为新格式
-        await saveTokensToStorage();
-      }
+      TOKENS.push(...result.value);
+      console.log(`[KV] Loaded ${TOKENS.length} tokens from KV`);
     }
   } catch (e) {
-    console.error("[Storage] Failed to load tokens:", e);
+    console.error("[KV] Failed to load tokens:", e);
   }
 }
 
-async function saveTokensToStorage(): Promise<void> {
-  if (!storage) return;
+async function saveTokensToKV(): Promise<void> {
+  if (!kv) return;
   try {
-    // 计算需要的分片数量
-    const chunks = Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE);
-    
-    // 保存每个分片
-    for (let i = 0; i < chunks; i++) {
-      const start = i * TOKENS_CHUNK_SIZE;
-      const end = Math.min(start + TOKENS_CHUNK_SIZE, TOKENS.length);
-      const chunk = TOKENS.slice(start, end);
-      await storage.set(["tokens_chunk", String(i)], chunk);
-    }
-    
-    // 删除旧的多余分片（如果tokens数量减少了）
-    const oldMeta = await storage.get<{ chunks: number }>(["tokens_meta"]);
-    if (oldMeta && oldMeta.chunks > chunks) {
-      for (let i = chunks; i < oldMeta.chunks; i++) {
-        await storage.delete(["tokens_chunk", String(i)]);
-      }
-    }
-    
-    // 保存元数据
-    await storage.set(["tokens_meta"], {
-      total: TOKENS.length,
-      chunks: chunks,
-      updated_at: Date.now()
-    });
-    
-    // 删除旧格式的数据（如果存在）
-    const legacy = await storage.get(["tokens"]);
-    if (legacy) {
-      await storage.delete(["tokens"]);
-    }
-    
-    console.log(`[Storage] Saved ${TOKENS.length} tokens in ${chunks} chunk(s)`);
+    await kv.set(["tokens"], TOKENS);
+    console.log(`[KV] Saved ${TOKENS.length} tokens to KV`);
   } catch (e) {
-    console.error("[Storage] Failed to save tokens:", e);
-    // 如果分片保存失败，尝试警告用户
-    if (String(e).includes("Value too large")) {
-      console.error("[Storage] ERROR: Token storage exceeded limits even with chunking!");
-      console.error("[Storage] Consider using SQLite storage (STORAGE_TYPE=sqlite) for large token sets");
-    }
+    console.error("[KV] Failed to save tokens:", e);
   }
 }
 
-async function loadStatsFromStorage(): Promise<void> {
-  if (!storage) return;
+async function loadStatsFromKV(): Promise<void> {
+  if (!kv) return;
   try {
-    const value = await storage.get<{
+    const result = await kv.get<{
       totalRequests: number;
       successRequests: number;
       failedRequests: number;
       tokenUsage: Record<string, number>;
       lastResetTime: number;
     }>(["stats"]);
-    if (value) {
-      stats.totalRequests = value.totalRequests ?? 0;
-      stats.successRequests = value.successRequests ?? 0;
-      stats.failedRequests = value.failedRequests ?? 0;
-      stats.tokenUsage = new Map(Object.entries(value.tokenUsage ?? {}));
-      stats.lastResetTime = value.lastResetTime ?? Date.now();
-      console.log(`[Storage] Loaded stats: ${stats.totalRequests} total requests`);
+    if (result.value) {
+      stats.totalRequests = result.value.totalRequests ?? 0;
+      stats.successRequests = result.value.successRequests ?? 0;
+      stats.failedRequests = result.value.failedRequests ?? 0;
+      stats.tokenUsage = new Map(Object.entries(result.value.tokenUsage ?? {}));
+      stats.lastResetTime = result.value.lastResetTime ?? Date.now();
+      console.log(`[KV] Loaded stats from KV: ${stats.totalRequests} total requests`);
     }
   } catch (e) {
-    console.error("[Storage] Failed to load stats:", e);
+    console.error("[KV] Failed to load stats:", e);
   }
 }
 
-async function saveStatsToStorage(): Promise<void> {
-  if (!storage) return;
+async function saveStatsToKV(): Promise<void> {
+  if (!kv) return;
   try {
-    await storage.set(["stats"], {
+    await kv.set(["stats"], {
       totalRequests: stats.totalRequests,
       successRequests: stats.successRequests,
       failedRequests: stats.failedRequests,
       tokenUsage: Object.fromEntries(stats.tokenUsage),
-                      lastResetTime: stats.lastResetTime
+      lastResetTime: stats.lastResetTime
     });
   } catch (e) {
-    console.error("[Storage] Failed to save stats:", e);
+    console.error("[KV] Failed to save stats:", e);
   }
 }
 
@@ -632,20 +241,10 @@ const stats = {
   successRequests: 0,
   failedRequests: 0,
   tokenUsage: new Map<string, number>(),
-  lastResetTime: Date.now(),
-  // 性能指标
-  avgResponseTime: 0,
-  totalResponseTime: 0,
-  responseCount: 0
+  lastResetTime: Date.now()
 };
 
-// 性能统计函数
-function recordResponseTime(ms: number) {
-  stats.totalResponseTime += ms;
-  stats.responseCount++;
-  stats.avgResponseTime = Math.round(stats.totalResponseTime / stats.responseCount);
-}
-
+// ============ 会话管理系统（长上下文支持） ============
 interface Session {
   sessionId: string;
   messages: Array<{ role: string; content: string; timestamp: number }>;
@@ -653,14 +252,6 @@ interface Session {
   lastAccessedAt: number;
   kbList?: string[];  // 保存 kb_list UUID v4 数组，连续对话时复用
   metadata?: Record<string, any>;
-  apiKey?: string;    // 关联的 API key（用于自动会话）
-  model?: string;     // 关联的模型（用于自动会话）
-}
-
-// 生成自动会话 ID（基于 API key + 模型）
-function generateAutoSessionId(apiKey: string, model: string): string {
-  const key = `auto_${apiKey}_${model}`.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return key.substring(0, 100); // 限制长度
 }
 
 class SessionManager {
@@ -674,11 +265,12 @@ class SessionManager {
       return session;
     }
 
-    if (storage) {
+    // 从KV加载
+    if (kv) {
       try {
-        const value = await storage.get<Session>(["sessions", sessionId]);
-        if (value) {
-          session = value;
+        const result = await kv.get<Session>(["sessions", sessionId]);
+        if (result.value) {
+          session = result.value;
           session.lastAccessedAt = Date.now();
           this.sessions.set(sessionId, session);
           return session;
@@ -704,9 +296,9 @@ class SessionManager {
   }
 
   async saveSession(session: Session): Promise<void> {
-    if (storage) {
+    if (kv) {
       try {
-        await storage.set(["sessions", session.sessionId], session, {
+        await kv.set(["sessions", session.sessionId], session, {
           expireIn: CONFIG.contextTTLSeconds * 1000
         });
       } catch (e) {
@@ -758,9 +350,9 @@ class SessionManager {
 
   async clearSession(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
-    if (storage) {
+    if (kv) {
       try {
-        await storage.delete(["sessions", sessionId]);
+        await kv.delete(["sessions", sessionId]);
       } catch (e) {
         log.error({ 事件: "会话删除失败", sessionId, 错误: String(e) });
       }
@@ -786,837 +378,34 @@ const sessionManager = new SessionManager();
 if (CONFIG.enableLongContext) {
   setInterval(() => {
     sessionManager.cleanupExpiredSessions().catch(e =>
-    log.error({ 事件: "会话清理失败", 错误: String(e) })
+      log.error({ 事件: "会话清理失败", 错误: String(e) })
     );
   }, 300000);
 }
 
-// ============ MCP工具定义 ============
-interface MCPTool {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: {
-      type: "object";
-      properties: Record<string, any>;
-      required: string[];
-    };
-  };
-}
-
-const MCP_TOOLS: MCPTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "web_search",
-      description: "Search the web for current information. Use this when you need up-to-date facts or recent events.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "The search query"
-          }
-        },
-        required: ["query"]
-      }
-    }
-  },
-{
-  type: "function",
-  function: {
-    name: "image_gen",
-    description: "Generate images based on text descriptions. Use this for creating visual content.",
-    parameters: {
-      type: "object",
-      properties: {
-        prompt: {
-          type: "string",
-          description: "Description of the image to generate"
-        },
-        size: {
-          type: "string",
-          description: "Image size (e.g., '1024x1024')",
-          enum: ["256x256", "512x512", "1024x1024"]
-        }
-      },
-      required: ["prompt"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "code_interpreter",
-    description: "Execute Python code for calculations, data analysis, or other programming tasks.",
-    parameters: {
-      type: "object",
-      properties: {
-        code: {
-          type: "string",
-          description: "Python code to execute"
-        }
-      },
-      required: ["code"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_read",
-    description: "Read the contents of a file. Supports text files and returns the content as a string.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path to the file to read (absolute or relative)"
-        }
-      },
-      required: ["path"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_write",
-    description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path to the file to write (absolute or relative)"
-        },
-        content: {
-          type: "string",
-          description: "The content to write to the file"
-        }
-      },
-      required: ["path", "content"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_list",
-    description: "List files and directories in a given path. Returns an array of file/directory names.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The directory path to list (defaults to current directory if not provided)"
-        },
-        recursive: {
-          type: "boolean",
-          description: "Whether to list files recursively (default: false)"
-        }
-      },
-      required: []
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "bash_execute",
-    description: "Execute bash commands in the CLI environment. Use this for running shell commands, git operations, package installations, etc.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description: "The bash command to execute"
-        },
-        timeout: {
-          type: "number",
-          description: "Timeout in seconds (default: 30)"
-        }
-      },
-      required: ["command"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_edit",
-    description: "Edit a specific part of a file by replacing text. Use this to make precise changes to files without rewriting the entire content.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path to the file to edit"
-        },
-        old_text: {
-          type: "string",
-          description: "The exact text to search for and replace"
-        },
-        new_text: {
-          type: "string",
-          description: "The new text to replace with"
-        }
-      },
-      required: ["path", "old_text", "new_text"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_delete",
-    description: "Delete a file from the filesystem. Use with caution as this operation cannot be undone.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path to the file to delete"
-        }
-      },
-      required: ["path"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_move",
-    description: "Move or rename a file. Can be used to reorganize files or change file names.",
-    parameters: {
-      type: "object",
-      properties: {
-        source: {
-          type: "string",
-          description: "The current path of the file"
-        },
-        destination: {
-          type: "string",
-          description: "The new path for the file"
-        }
-      },
-      required: ["source", "destination"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "directory_create",
-    description: "Create a new directory. Will create parent directories if they don't exist.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path of the directory to create"
-        }
-      },
-      required: ["path"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "directory_delete",
-    description: "Delete a directory and all its contents. Use with extreme caution as this operation cannot be undone.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The path of the directory to delete"
-        },
-        recursive: {
-          type: "boolean",
-          description: "Whether to delete recursively (required for non-empty directories)"
-        }
-      },
-      required: ["path"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "search_files",
-    description: "Search for text patterns in files using grep-like functionality. Returns matching lines with file paths and line numbers.",
-    parameters: {
-      type: "object",
-      properties: {
-        pattern: {
-          type: "string",
-          description: "The text pattern or regex to search for"
-        },
-        path: {
-          type: "string",
-          description: "The directory path to search in (defaults to current directory)"
-        },
-        file_pattern: {
-          type: "string",
-          description: "File pattern to filter (e.g., '*.js', '*.py')"
-        },
-        case_sensitive: {
-          type: "boolean",
-          description: "Whether the search should be case-sensitive (default: false)"
-        }
-      },
-      required: ["pattern"]
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "get_working_directory",
-    description: "Get the current working directory path. Use this to understand where you are in the filesystem.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: []
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "environment_info",
-    description: "Get information about the current environment including OS, platform, architecture, and environment variables.",
-    parameters: {
-      type: "object",
-      properties: {
-        include_env_vars: {
-          type: "boolean",
-          description: "Whether to include environment variables (default: false)"
-        }
-      },
-      required: []
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "git_status",
-    description: "Get the current git repository status including branch, staged files, unstaged files, and untracked files.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The repository path (defaults to current directory)"
-        }
-      },
-      required: []
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "git_diff",
-    description: "Get git diff output to see changes in files. Can show staged or unstaged changes.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "The repository path (defaults to current directory)"
-        },
-        staged: {
-          type: "boolean",
-          description: "Show staged changes (default: false shows unstaged)"
-        },
-        file: {
-          type: "string",
-          description: "Specific file to show diff for (optional)"
-        }
-      },
-      required: []
-    }
-  }
-},
-{
-  type: "function",
-  function: {
-    name: "file_search",
-    description: "Find files by name pattern. Similar to 'find' command but returns a list of matching file paths.",
-    parameters: {
-      type: "object",
-      properties: {
-        pattern: {
-          type: "string",
-          description: "The file name pattern to search for (supports wildcards)"
-        },
-        path: {
-          type: "string",
-          description: "The directory path to search in (defaults to current directory)"
-        },
-        type: {
-          type: "string",
-          description: "Filter by type: 'file', 'directory', or 'all' (default: 'all')",
-          enum: ["file", "directory", "all"]
-        }
-      },
-      required: ["pattern"]
-    }
-  }
-}
-];
-
-// CLI工具集名称列表（用于CLI模式自动注入）
-const CLI_TOOLS = [
-  "file_read",
-  "file_write",
-  "file_edit",
-  "file_delete",
-  "file_move",
-  "file_list",
-  "file_search",
-  "directory_create",
-  "directory_delete",
-  "search_files",
-  "bash_execute",
-  "get_working_directory",
-  "environment_info",
-  "git_status",
-  "git_diff"
-];
-
-// 常用工具集名称列表
-const COMMON_TOOLS = [
-  "web_search",
-  "image_gen",
-  "code_interpreter"
-];
-
-// ============ 工具调用检测 ============
-// 从AI响应中提取工具调用请求
-function extractToolCalls(content: string): Array<{ name: string; arguments: any }> {
-  const toolCalls: Array<{ name: string; arguments: any }> = [];
-  
-  // 匹配类似 <tool_call name="file_read">{"path": "test.txt"}</tool_call> 的格式
-  const xmlPattern = /<tool_call\s+name="([^"]+)"\s*>(.*?)<\/tool_call>/gs;
-  let match;
-  while ((match = xmlPattern.exec(content)) !== null) {
-    try {
-      const name = match[1];
-      const args = JSON.parse(match[2]);
-      toolCalls.push({ name, arguments: args });
-    } catch {}
-  }
-  
-  // 如果没找到XML格式，尝试匹配JSON格式
-  if (toolCalls.length === 0) {
-    // 匹配 ```json\n{"tool": "xxx", "arguments": {...}}\n``` 格式
-    const jsonPattern = /```json\s*\n\s*\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}\s*\n```/gs;
-    while ((match = jsonPattern.exec(content)) !== null) {
-      try {
-        const name = match[1];
-        const args = JSON.parse(match[2]);
-        toolCalls.push({ name, arguments: args });
-      } catch {}
-    }
-  }
-  
-  return toolCalls;
-}
-
-// 构造工具调用提示词
-function buildToolCallPrompt(tools: any[]): string {
-  const toolNames = tools.map(t => t.function.name).join(", ");
-  return `
-When you need to use a tool, respond EXACTLY in this format:
-<tool_call name="TOOL_NAME">{"param1": "value1", "param2": "value2"}</tool_call>
-
-Available tools: ${toolNames}
-
-Example:
-<tool_call name="file_read">{"path": "./test.txt"}</tool_call>
-
-You can call multiple tools in one response. After the tool execution, I will provide the results and you can continue.
-`.trim();
-}
-
-// ============ 工具调用代理循环 ============
-async function chatWithToolProxy(opts: {
-  reqId: string;
-  token: string;
-  body: any;
-  modelName: string;
-  mcpTools: any[];
-}): Promise<{ kind: "nonstream"; status: number; content: string; headers: Headers; isEmpty?: boolean; isTruncated?: boolean; toolExecutions?: any[] }> {
-  const { reqId, token, body, modelName, mcpTools } = opts;
-  const logCtx = { 请求ID: reqId, 模型: modelName };
-  
-  // 调用上游API（只调用一次）
-  const result = await callUpstreamChat({
-    reqId,
-    token,
-    body,
-    forceStream: false,
-    isExternalStream: false,
-    modelName
-  });
-  
-  if (result.kind === "stream") {
-    // 不应该发生，因为 forceStream=false
-    log.warn({ 事件: "工具代理收到流式响应", ...logCtx });
-    return { kind: "nonstream", status: 500, content: "Unexpected stream response", headers: new Headers(), toolExecutions: [] };
-  }
-  
-  const { status, content, headers } = result;
-  
-  // 非2xx响应，直接返回
-  if (status < 200 || status >= 300) {
-    return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions: [] };
-  }
-  
-  // 提取工具调用
-  const toolCalls = extractToolCalls(content);
-  
-  if (toolCalls.length === 0) {
-    // 没有工具调用，直接返回
-    return { kind: "nonstream", status, content, headers, isEmpty: false, isTruncated: false, toolExecutions: [] };
-  }
-  
-  // 执行所有工具调用
-  log.info({ 事件: "检测到工具调用", 工具数: toolCalls.length, 工具: toolCalls.map(t => t.name), ...logCtx });
-  
-  const toolExecutions: any[] = [];
-  for (const call of toolCalls) {
-    const execution = await executeToolCall(call.name, call.arguments);
-    toolExecutions.push({
-      tool: call.name,
-      arguments: call.arguments,
-      timestamp: new Date().toISOString(),
-      ...execution
-    });
-  }
-  
-  log.info({ 事件: "工具执行完成", 工具数: toolExecutions.length, 成功数: toolExecutions.filter(t => t.success).length, ...logCtx });
-  
-  // 返回原始AI响应 + 工具执行结果（不再循环）
-  // 客户端可以在响应的 toolExecutions 字段中看到所有执行结果
-  // 客户端可以自己决定是否继续对话
-  return { 
-    kind: "nonstream", 
-    status, 
-    content, 
-    headers, 
-    isEmpty: false, 
-    isTruncated: false, 
-    toolExecutions 
-  };
-}
-
-// ============ 工具执行引擎 ============
-async function executeToolCall(toolName: string, args: any): Promise<{ success: boolean; result?: any; error?: string }> {
-  try {
-    log.debug({ 事件: "执行工具调用", 工具: toolName, 参数: args });
-    
-    switch (toolName) {
-      case "file_read": {
-        const { path } = args;
-        if (!path) return { success: false, error: "Missing required parameter: path" };
-        try {
-          const content = await Deno.readTextFile(path);
-          return { success: true, result: content };
-        } catch (e) {
-          return { success: false, error: `Failed to read file: ${e}` };
-        }
-      }
-      
-      case "file_write": {
-        const { path, content } = args;
-        if (!path || content === undefined) return { success: false, error: "Missing required parameters: path, content" };
-        try {
-          await Deno.writeTextFile(path, content);
-          return { success: true, result: `File written successfully: ${path}` };
-        } catch (e) {
-          return { success: false, error: `Failed to write file: ${e}` };
-        }
-      }
-      
-      case "file_edit": {
-        const { path, old_text, new_text } = args;
-        if (!path || !old_text || new_text === undefined) {
-          return { success: false, error: "Missing required parameters: path, old_text, new_text" };
-        }
-        try {
-          const content = await Deno.readTextFile(path);
-          if (!content.includes(old_text)) {
-            return { success: false, error: "Old text not found in file" };
-          }
-          const newContent = content.replace(old_text, new_text);
-          await Deno.writeTextFile(path, newContent);
-          return { success: true, result: `File edited successfully: ${path}` };
-        } catch (e) {
-          return { success: false, error: `Failed to edit file: ${e}` };
-        }
-      }
-      
-      case "file_delete": {
-        const { path } = args;
-        if (!path) return { success: false, error: "Missing required parameter: path" };
-        try {
-          await Deno.remove(path);
-          return { success: true, result: `File deleted: ${path}` };
-        } catch (e) {
-          return { success: false, error: `Failed to delete file: ${e}` };
-        }
-      }
-      
-      case "file_move": {
-        const { source, destination } = args;
-        if (!source || !destination) return { success: false, error: "Missing required parameters: source, destination" };
-        try {
-          await Deno.rename(source, destination);
-          return { success: true, result: `File moved: ${source} -> ${destination}` };
-        } catch (e) {
-          return { success: false, error: `Failed to move file: ${e}` };
-        }
-      }
-      
-      case "file_list": {
-        const { path = ".", recursive = false } = args;
-        try {
-          const items: string[] = [];
-          if (recursive) {
-            for await (const entry of Deno.readDir(path)) {
-              items.push(entry.name);
-              if (entry.isDirectory) {
-                try {
-                  for await (const subEntry of Deno.readDir(`${path}/${entry.name}`)) {
-                    items.push(`${entry.name}/${subEntry.name}`);
-                  }
-                } catch {}
-              }
-            }
-          } else {
-            for await (const entry of Deno.readDir(path)) {
-              items.push(entry.name);
-            }
-          }
-          return { success: true, result: items.join("\n") };
-        } catch (e) {
-          return { success: false, error: `Failed to list directory: ${e}` };
-        }
-      }
-      
-      case "file_search": {
-        const { pattern, path = ".", type = "all" } = args;
-        if (!pattern) return { success: false, error: "Missing required parameter: pattern" };
-        try {
-          const matches: string[] = [];
-          for await (const entry of Deno.readDir(path)) {
-            const regex = new RegExp(pattern.replace(/\*/g, ".*"));
-            if (regex.test(entry.name)) {
-              if (type === "all" || 
-                  (type === "file" && entry.isFile) || 
-                  (type === "directory" && entry.isDirectory)) {
-                matches.push(entry.name);
-              }
-            }
-          }
-          return { success: true, result: matches.length > 0 ? matches.join("\n") : "No matches found" };
-        } catch (e) {
-          return { success: false, error: `Failed to search files: ${e}` };
-        }
-      }
-      
-      case "directory_create": {
-        const { path } = args;
-        if (!path) return { success: false, error: "Missing required parameter: path" };
-        try {
-          await Deno.mkdir(path, { recursive: true });
-          return { success: true, result: `Directory created: ${path}` };
-        } catch (e) {
-          return { success: false, error: `Failed to create directory: ${e}` };
-        }
-      }
-      
-      case "directory_delete": {
-        const { path, recursive = false } = args;
-        if (!path) return { success: false, error: "Missing required parameter: path" };
-        try {
-          await Deno.remove(path, { recursive });
-          return { success: true, result: `Directory deleted: ${path}` };
-        } catch (e) {
-          return { success: false, error: `Failed to delete directory: ${e}` };
-        }
-      }
-      
-      case "search_files": {
-        const { pattern, path = ".", file_pattern, case_sensitive = false } = args;
-        if (!pattern) return { success: false, error: "Missing required parameter: pattern" };
-        try {
-          const cmd = new Deno.Command("grep", {
-            args: [
-              case_sensitive ? "" : "-i",
-              "-r",
-              pattern,
-              path
-            ].filter(Boolean),
-            stdout: "piped",
-            stderr: "piped"
-          });
-          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
-          const result = new TextDecoder().decode(stdout);
-          const error = new TextDecoder().decode(stderr);
-          if (!cmdSuccess && !result) {
-            return { success: false, error: error || "No matches found" };
-          }
-          return { success: true, result: result || "No matches found" };
-        } catch (e) {
-          return { success: false, error: `Failed to search: ${e}` };
-        }
-      }
-      
-      case "bash_execute": {
-        const { command, timeout = 30 } = args;
-        if (!command) return { success: false, error: "Missing required parameter: command" };
-        try {
-          const cmd = new Deno.Command("bash", {
-            args: ["-c", command],
-            stdout: "piped",
-            stderr: "piped"
-          });
-          const process = cmd.spawn();
-          
-          // 超时控制
-          const timeoutId = setTimeout(() => {
-            try { process.kill(); } catch {}
-          }, timeout * 1000);
-          
-          const { stdout, stderr, success: cmdSuccess } = await process.output();
-          clearTimeout(timeoutId);
-          
-          const result = new TextDecoder().decode(stdout);
-          const error = new TextDecoder().decode(stderr);
-          
-          return {
-            success: true,
-            result: JSON.stringify({
-              success: cmdSuccess,
-              stdout: result,
-              stderr: error,
-              exit_code: cmdSuccess ? 0 : 1
-            }, null, 2)
-          };
-        } catch (e) {
-          return { success: false, error: `Failed to execute command: ${e}` };
-        }
-      }
-      
-      case "get_working_directory": {
-        try {
-          const cwd = Deno.cwd();
-          return { success: true, result: cwd };
-        } catch (e) {
-          return { success: false, error: `Failed to get working directory: ${e}` };
-        }
-      }
-      
-      case "environment_info": {
-        const { include_env_vars = false } = args;
-        try {
-          const info: any = {
-            os: Deno.build.os,
-            arch: Deno.build.arch,
-            cwd: Deno.cwd()
-          };
-          if (include_env_vars) {
-            info.env = Deno.env.toObject();
-          }
-          return { success: true, result: JSON.stringify(info, null, 2) };
-        } catch (e) {
-          return { success: false, error: `Failed to get environment info: ${e}` };
-        }
-      }
-      
-      case "git_status": {
-        const { path = "." } = args;
-        try {
-          const cmd = new Deno.Command("git", {
-            args: ["-C", path, "status"],
-            stdout: "piped",
-            stderr: "piped"
-          });
-          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
-          const result = new TextDecoder().decode(stdout);
-          const error = new TextDecoder().decode(stderr);
-          if (!cmdSuccess) {
-            return { success: false, error: error || "Git command failed" };
-          }
-          return { success: true, result };
-        } catch (e) {
-          return { success: false, error: `Failed to get git status: ${e}` };
-        }
-      }
-      
-      case "git_diff": {
-        const { path = ".", staged = false, file } = args;
-        try {
-          const args_arr = ["-C", path, "diff"];
-          if (staged) args_arr.push("--staged");
-          if (file) args_arr.push(file);
-          
-          const cmd = new Deno.Command("git", {
-            args: args_arr,
-            stdout: "piped",
-            stderr: "piped"
-          });
-          const { stdout, stderr, success: cmdSuccess } = await cmd.output();
-          const result = new TextDecoder().decode(stdout);
-          const error = new TextDecoder().decode(stderr);
-          if (!cmdSuccess && error) {
-            return { success: false, error };
-          }
-          return { success: true, result: result || "No changes" };
-        } catch (e) {
-          return { success: false, error: `Failed to get git diff: ${e}` };
-        }
-      }
-      
-      default:
-        return { success: false, error: `Unknown tool: ${toolName}` };
-    }
-  } catch (e) {
-    return { success: false, error: `Tool execution error: ${e}` };
-  }
-}
-
-// 加载初始数据
-if (storage) {
-  await loadConfigFromStorage();  // 先加载配置
-  await loadTokensFromStorage();  // 从存储加载已保存的tokens
+// 从 KV 加载初始数据
+if (USE_KV && kv) {
+  await loadConfigFromKV();  // 先加载配置
+  await loadTokensFromKV();  // 从KV加载已保存的tokens
   await syncTokensFromEnv(); // 同步环境变量中的tokens（差异或完全同步）
-  await loadStatsFromStorage();
-  await saveConfigToStorage();  // 保存当前配置（如果存储中没有）
+  await loadStatsFromKV();
+  await saveConfigToKV();  // 保存当前配置（如果KV中没有）
 } else {
-  // 如果没有存储，也执行环境变量同步（只是不保存）
-  const envTokensStr = getEnv("FLOWITH_AUTH_TOKENS");
+  // 如果没有KV，也执行环境变量同步（只是不保存到KV）
+  const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
   const envTokens = Array.from(new Set(
     envTokensStr.split(",").map(s => s.trim()).filter(Boolean)
   ));
   if (envTokens.length > 0 && TOKENS.length === 0) {
     TOKENS.push(...envTokens);
-    console.log(`[Sync] Loaded ${TOKENS.length} tokens from environment (no storage)`);
+    console.log(`[Sync] Loaded ${TOKENS.length} tokens from environment (no KV)`);
   }
 }
 
-// 定期保存统计数据（每30秒）
-if (storage) {
+// 定期保存统计数据到 KV（每30秒）
+if (USE_KV && kv) {
   setInterval(() => {
-    saveStatsToStorage().catch(e => console.error("[Storage] Auto-save stats failed:", e));
+    saveStatsToKV().catch(e => console.error("[KV] Auto-save stats failed:", e));
   }, 30000);
 }
 const mask = (s?:string|null)=>!s?"":(s.length<=8?"***":`${s.slice(0,4)}...${s.slice(-4)}`);
@@ -1644,24 +433,24 @@ function nextToken(): { idx:number, token:string, totalCalls: number } | null {
     log.warn({ 事件:"无可用token", 时间: new Date().toISOString() });
     return null;
   }
-
+  
   // 原子操作：获取当前索引并自增
   const currentIndex = Atomics.load(rrView, 0);
   const nextIndex = (currentIndex + 1) % n;
   Atomics.store(rrView, 0, nextIndex);
-
+  
   // 获取当前要使用的token
   const idx = currentIndex % n;
   const token = TOKENS[idx];
-
+  
   // 更新token使用统计
   const maskedToken = mask(token);
   stats.tokenUsage.set(maskedToken, (stats.tokenUsage.get(maskedToken) ?? 0) + 1);
-
+  
   // 返回详细信息
-  return {
-    idx,
-    token,
+  return { 
+    idx, 
+    token, 
     totalCalls: currentIndex + 1  // 总调用次数
   };
 }
@@ -1695,30 +484,25 @@ function delay(ms:number){ return new Promise(r=>setTimeout(r,ms)); }
 function isAdminAuthorized(req:Request): boolean {
   const auth = req.headers.get("authorization") ?? "";
   const provided = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-
+  
   // 优先使用 ADMIN_KEY，如果没有则使用 API_KEYS
   if (ADMIN_KEY) {
     return provided === ADMIN_KEY;
   }
-
+  
   // 如果没有 ADMIN_KEY，则检查 API_KEYS（任何一个 API_KEY 都可以作为管理员）
   if (API_KEYS.length > 0) {
     return API_KEYS.includes(provided);
   }
-
+  
   return false; // 没有配置任何密钥
 }
 async function addToken(token:string): Promise<{ success:boolean, message:string }> {
   const trimmed = token.trim();
   if (!trimmed) return { success:false, message:"Token cannot be empty" };
-  
-  // 使用完整token进行比较，而不是掩码后的token
-  const exists = TOKENS.some(existingToken => existingToken === trimmed);
-  if (exists) return { success:false, message:"Token already exists" };
-  
+  if (TOKENS.includes(trimmed)) return { success:false, message:"Token already exists" };
   TOKENS.push(trimmed);
-  await saveTokensToStorage();
-  log.info({ 事件:"Token已添加", token: mask(trimmed), 当前总数: TOKENS.length });
+  await saveTokensToKV();
   return { success:true, message:"Token added successfully" };
 }
 async function removeToken(token:string): Promise<{ success:boolean, message:string }> {
@@ -1726,46 +510,32 @@ async function removeToken(token:string): Promise<{ success:boolean, message:str
   const idx = TOKENS.indexOf(trimmed);
   if (idx === -1) return { success:false, message:"Token not found" };
   TOKENS.splice(idx, 1);
-  await saveTokensToStorage();
+  await saveTokensToKV();
   return { success:true, message:"Token removed successfully" };
 }
 async function addTokensBatch(tokens: string[]): Promise<{ success:boolean, message:string, added:number, skipped:number, failed:string[] }> {
   let added = 0;
   let skipped = 0;
   const failed: string[] = [];
-
+  
   for (const token of tokens) {
     const trimmed = token.trim();
     if (!trimmed) {
       failed.push(`Empty token`);
       continue;
     }
-    // 使用完整token进行比较
-    const exists = TOKENS.some(existingToken => existingToken === trimmed);
-    if (exists) {
+    if (TOKENS.includes(trimmed)) {
       skipped++;
       continue;
     }
     TOKENS.push(trimmed);
     added++;
   }
-
+  
   if (added > 0) {
-    try {
-      await saveTokensToStorage();
-    } catch (e) {
-      // 如果保存失败，回滚已添加的tokens
-      TOKENS.splice(-added);
-      return {
-        success: false,
-        message: `Failed to save tokens: ${String(e)}`,
-        added: 0,
-        skipped,
-        failed: [...failed, ...tokens.slice(-added).map(t => `${t} (rollback)`)]
-      };
-    }
+    await saveTokensToKV();
   }
-
+  
   return {
     success: added > 0,
     message: `Added ${added} tokens, skipped ${skipped} duplicates${failed.length > 0 ? `, ${failed.length} failed` : ''}`,
@@ -1777,11 +547,11 @@ async function addTokensBatch(tokens: string[]): Promise<{ success:boolean, mess
 async function removeTokensBatch(tokens: string[]): Promise<{ success:boolean, message:string, removed:number, notFound:number }> {
   let removed = 0;
   let notFound = 0;
-
+  
   for (const token of tokens) {
     const trimmed = token.trim();
     if (!trimmed) continue;
-
+    
     const idx = TOKENS.indexOf(trimmed);
     if (idx === -1) {
       notFound++;
@@ -1790,11 +560,11 @@ async function removeTokensBatch(tokens: string[]): Promise<{ success:boolean, m
     TOKENS.splice(idx, 1);
     removed++;
   }
-
+  
   if (removed > 0) {
-    await saveTokensToStorage();
+    await saveTokensToKV();
   }
-
+  
   return {
     success: removed > 0,
     message: `Removed ${removed} tokens${notFound > 0 ? `, ${notFound} not found` : ''}`,
@@ -1805,7 +575,7 @@ async function removeTokensBatch(tokens: string[]): Promise<{ success:boolean, m
 async function clearAllTokens(): Promise<{ success:boolean, message:string, cleared:number }> {
   const count = TOKENS.length;
   TOKENS.length = 0;
-  await saveTokensToStorage();
+  await saveTokensToKV();
   return {
     success: true,
     message: `Cleared ${count} tokens`,
@@ -1813,41 +583,41 @@ async function clearAllTokens(): Promise<{ success:boolean, message:string, clea
   };
 }
 
-// 启动时同步环境变量中的tokens
+// 启动时同步环境变量中的tokens到KV
 async function syncTokensFromEnv(): Promise<void> {
-  const envTokensStr = getEnv("FLOWITH_AUTH_TOKENS");
+  const envTokensStr = Deno.env.get("FLOWITH_AUTH_TOKENS") ?? "";
   const envTokens = Array.from(new Set(
     envTokensStr.split(",").map(s => s.trim()).filter(Boolean)
   ));
-
-  const rsyncMode = getEnv("RSYNC", "0").trim() === "1";
-
+  
+  const rsyncMode = (Deno.env.get("RSYNC") ?? "0").trim() === "1";
+  
   if (envTokens.length === 0) {
     console.log("[Sync] No tokens in environment variable, skipping sync");
     return;
   }
-
+  
   if (rsyncMode) {
-    // 完全同步模式：清空存储，完全替换
+    // 完全同步模式：清空KV，完全替换
     console.log(`[Sync] RSYNC mode enabled: clearing all tokens and loading ${envTokens.length} tokens from environment`);
     TOKENS.length = 0;
     TOKENS.push(...envTokens);
-    await saveTokensToStorage();
+    await saveTokensToKV();
     console.log(`[Sync] Full sync completed: ${TOKENS.length} tokens loaded`);
   } else {
-    // 差异同步模式：只添加新的token，保留存储中已有的
+    // 差异同步模式：只添加新的token，保留KV中已有的
     const existingSet = new Set(TOKENS);
     const newTokens: string[] = [];
-
+    
     for (const token of envTokens) {
       if (!existingSet.has(token)) {
         TOKENS.push(token);
         newTokens.push(token);
       }
     }
-
+    
     if (newTokens.length > 0) {
-      await saveTokensToStorage();
+      await saveTokensToKV();
       console.log(`[Sync] Differential sync completed: added ${newTokens.length} new tokens, total ${TOKENS.length} tokens`);
     } else {
       console.log(`[Sync] Differential sync completed: no new tokens to add, total ${TOKENS.length} tokens`);
@@ -1859,45 +629,25 @@ async function fetchWithHeaderTimeout(input: Request|string, init: RequestInit &
   const { headerTimeoutMs, logCtx, ...rest } = init;
   const controller = new AbortController();
   const timer = setTimeout(()=>controller.abort(new Error("upstream header timeout")), headerTimeoutMs);
-  
-  // 代理支持：Deno会自动读取环境变量HTTP_PROXY/HTTPS_PROXY
-  // 如果配置了PROXY_URL，设置到环境变量中
-  if (CONFIG.proxyUrl && !getEnv("HTTP_PROXY") && !getEnv("HTTPS_PROXY")) {
-    try {
-      Deno.env.set("HTTP_PROXY", CONFIG.proxyUrl);
-      Deno.env.set("HTTPS_PROXY", CONFIG.proxyUrl);
-      log.debug({ 事件:"代理配置", 代理URL: CONFIG.proxyUrl });
-    } catch (e) {
-      // 非Deno环境，忽略代理设置错误
-      log.debug({ 事件:"代理配置跳过", 原因: "非Deno环境" });
-    }
-  }
-  
-  const startTime = Date.now();
   try{
-    log.debug({ 
-      事件:"上游请求", 
-      方法:(rest.method ?? "GET"), 
-      URL: typeof input==="string"? input : (input as Request).url,
-      ...logCtx 
-    });
-    
+    const hdrs = new Headers(rest.headers as HeadersInit);
+    const hdrEntries = Object.fromEntries(hdrs.entries());
+    if (hdrEntries["authorization"]) hdrEntries["authorization"] = `Bearer ${mask((hdrEntries["authorization"] as string).slice(7))}`;
+    log.info({ 事件:"上游请求", 方法:(rest.method ?? "GET"), URL: typeof input==="string"? input : (input as Request).url, 头: hdrEntries, ...logCtx });
     const resp = await fetch(input, { ...rest, signal: controller.signal });
     clearTimeout(timer);
-    
-    const elapsed = Date.now() - startTime;
     log.info({
-      事件:"上游响应",
+      事件:"上游响应头",
       状态: resp.status,
-      类型: resp.headers.get("content-type")?.split(";")[0] ?? "",
-      耗时ms: elapsed,
+      类型: resp.headers.get("content-type") ?? "",
+             长度: resp.headers.get("content-length") ?? "",
+             头: Object.fromEntries(resp.headers.entries()),
              ...logCtx
     });
     return resp;
   }catch(e){
     clearTimeout(timer);
-    const elapsed = Date.now() - startTime;
-    log.warn({ 事件:"上游请求失败", 错误:String((e as any)?.message ?? e), 耗时ms: elapsed, ...logCtx });
+    log.warn({ 事件:"上游请求异常/首包超时", 错误:String((e as any)?.message ?? e), ...logCtx });
     throw e;
   }
 }
@@ -1910,41 +660,11 @@ function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout", logCtx?:an
     p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
   });
 }
-// 缓存OpenAI格式对象以减少重复创建
-const openaiChunkCache = new Map<string, any>();
 function openaiChunk(model:string, textDelta:string){
-  // 对于空内容或长内容不缓存
-  if (!textDelta || textDelta.length > 100) {
-    return { 
-      id: "chatcmpl_" + Math.random().toString(36).slice(2), 
-      object:"chat.completion.chunk",
-      created: Math.floor(Date.now()/1000), 
-      model,
-      choices:[{ index:0, delta:{ content:textDelta }, finish_reason:null }] 
-    };
-  }
-  
-  const cacheKey = `${model}:${textDelta}`;
-  if (openaiChunkCache.has(cacheKey)) {
-    return openaiChunkCache.get(cacheKey);
-  }
-  
-  const chunk = { 
-    id: "chatcmpl_" + Math.random().toString(36).slice(2), 
-    object:"chat.completion.chunk",
-    created: Math.floor(Date.now()/1000), 
-    model,
-    choices:[{ index:0, delta:{ content:textDelta }, finish_reason:null }] 
-  };
-  
-  // 限制缓存大小
-  if (openaiChunkCache.size < 1000) {
-    openaiChunkCache.set(cacheKey, chunk);
-  }
-  
-  return chunk;
+  return { id: "chatcmpl_" + Math.random().toString(36).slice(2), object:"chat.completion.chunk",
+    created: Math.floor(Date.now()/1000), model,
+    choices:[{ index:0, delta:{ content:textDelta }, finish_reason:null }] };
 }
-
 function openaiNonStream(model:string, content:string){
   return { id: "chatcmpl_" + Math.random().toString(36).slice(2), object:"chat.completion",
     created: Math.floor(Date.now()/1000), model,
@@ -1967,6 +687,122 @@ function flattenContent(content:any):string{
   return String(content);
 }
 function normalizeMessages(messages:any[]){ return messages.map(m=>({ role:(m?.role ?? "user").toString(), content: flattenContent(m?.content) })); }
+
+// ============ 工具调用格式检测和转换 ============
+/**
+ * 检测字符串中是否包含错误的工具调用格式（<tool_call>标记）
+ */
+function hasIncorrectToolCallFormat(content: string): boolean {
+  return /<tool_call\s+name=["']([^"']+)["']\s*>/.test(content) || 
+         /<tool_call\s*>\s*{/.test(content);
+}
+
+/**
+ * 尝试将错误的工具调用格式转换为正确的 tool_use 格式
+ * 输入: "text <tool_call name=\"tool_name\">{\"param\":\"value\"}</tool_call>"
+ * 输出: { role: "assistant", content: [{type:"text",text:"text"},{type:"tool_use",id:"...",name:"tool_name",input:{...}}] }
+ */
+function convertToolCallFormat(content: string, modelName: string): any {
+  const toolCallPattern = /<tool_call(?:\s+name=["']([^"']+)["'])?\s*>([\s\S]*?)<\/tool_call>/g;
+  const matches = [...content.matchAll(toolCallPattern)];
+  
+  if (matches.length === 0) {
+    // 没有找到工具调用，返回原内容
+    return null;
+  }
+
+  const contentBlocks: any[] = [];
+  let lastIndex = 0;
+
+  for (const match of matches) {
+    const fullMatch = match[0];
+    const toolName = match[1];
+    const toolInput = match[2]?.trim() || "{}";
+    const matchIndex = match.index!;
+
+    // 添加工具调用前的文本（如果有）
+    if (matchIndex > lastIndex) {
+      const textBefore = content.slice(lastIndex, matchIndex).trim();
+      if (textBefore) {
+        contentBlocks.push({
+          type: "text",
+          text: textBefore
+        });
+      }
+    }
+
+    // 解析工具输入
+    let parsedInput: any = {};
+    try {
+      parsedInput = JSON.parse(toolInput);
+    } catch (e) {
+      // 如果解析失败，尝试提取 name 和参数
+      const nameMatch = toolInput.match(/["']?name["']?\s*:\s*["']([^"']+)["']/);
+      if (nameMatch && !toolName) {
+        // 从JSON中提取name
+        try {
+          parsedInput = JSON.parse(toolInput);
+        } catch {}
+      } else {
+        parsedInput = { raw: toolInput };
+      }
+    }
+
+    // 如果从 name 属性中提取，优先使用
+    const finalToolName = toolName || parsedInput.name || "unknown_tool";
+    
+    // 如果 parsedInput 中有 name 字段，移除它（因为会放在外层）
+    if (parsedInput.name) {
+      const { name, ...rest } = parsedInput;
+      parsedInput = rest;
+    }
+
+    // 添加 tool_use 块
+    contentBlocks.push({
+      type: "tool_use",
+      id: "toolu_" + crypto.randomUUID().replace(/-/g, "").slice(0, 20),
+      name: finalToolName,
+      input: parsedInput
+    });
+
+    lastIndex = matchIndex + fullMatch.length;
+  }
+
+  // 添加最后剩余的文本（如果有）
+  if (lastIndex < content.length) {
+    const textAfter = content.slice(lastIndex).trim();
+    if (textAfter) {
+      contentBlocks.push({
+        type: "text",
+        text: textAfter
+      });
+    }
+  }
+
+  // 如果没有文本块，添加一个空文本块
+  if (contentBlocks.length > 0 && contentBlocks.every((b: any) => b.type !== "text")) {
+    contentBlocks.unshift({
+      type: "text",
+      text: "I'll help you with that."
+    });
+  }
+
+  return {
+    id: "chatcmpl_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelName,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: contentBlocks
+      },
+      finish_reason: "tool_calls"
+    }],
+    usage: null
+  };
+}
 function extractDeltaFromTextChunk(raw: string): { delta: string; isFinal: boolean } {
   let s = (raw ?? "").trim();
   if (!s) return { delta: "", isFinal: false };
@@ -2129,42 +965,17 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
         const data = dataLines.join("\n");
         log.debug({ 事件:"上游SSE分片(聚合)", 原文预览: data.slice(0, 200), 块序号: chunkCount, ...logCtx });
 
-        // 检查是否为 [DONE] 标记（非JSON格式）
-        if (data === "[DONE]") {
-          log.debug({ 事件:"收到[DONE]标记", ...logCtx });
-          readerClosed = true;
-          break;
-        }
-
         try {
           const obj = JSON.parse(data);
-          // Flowith格式：每个chunk都有tag:final，只有content为"[DONE]"时才真正结束
-          if (obj?.tag === "seeds") {
-            // seeds标记，跳过
-            log.debug({ 事件:"收到seeds标记", 内容: obj.content, ...logCtx });
-            continue;
-          }
-
-          if (obj?.tag === "final") {
-            const delta = typeof obj?.content === "string" ? obj.content : String(obj.content ?? "");
-            // 检查是否为结束标记
-            if (delta === "[DONE]") {
-              log.debug({ 事件:"收到final+[DONE]标记", ...logCtx });
-              readerClosed = true;
-              break;
-            }
-            // 正常内容，累加
-            if (delta) content += delta;
-          } else {
-            // 其他格式兼容
-            const delta = typeof obj?.content === "string" ? obj.content : "";
-            if (delta) content += delta;
-          }
+          const delta = typeof obj?.content === "string"
+          ? obj.content
+          : (obj?.tag === "final" ? String(obj.content ?? "") : "");
+          if (delta) content += delta;
+          if (obj?.tag === "final") { readerClosed = true; break; }
         } catch {
-          // JSON解析失败，尝试提取文本
           const { delta, isFinal } = extractDeltaFromTextChunk(data);
-          if (delta && delta !== "[DONE]") content += delta;
-          if (isFinal || delta === "[DONE]") { readerClosed = true; break; }
+          if (delta) content += delta;
+          if (isFinal) { readerClosed = true; break; }
         }
       }
     }
@@ -2179,18 +990,18 @@ async function aggregateFromStreamResponse(args: { resp: Response, logCtx:any, m
 
   const isEmpty = content.length < SSE_MIN_CONTENT_LENGTH;
   if (isEmpty || isTruncated) {
-    log.warn({
-      事件:"上游SSE异常结束",
-      字数: content.length,
+    log.warn({ 
+      事件:"上游SSE异常结束", 
+      字数: content.length, 
       块数: chunkCount,
-      是否为空: isEmpty,
+      是否为空: isEmpty, 
       是否截断: isTruncated,
-      ...logCtx
+      ...logCtx 
     });
   } else {
     log.info({ 事件:"上游SSE聚合完成", 字数: content.length, 块数: chunkCount, ...logCtx });
   }
-
+  
   return { kind:"nonstream", status: resp.status, content, headers: resp.headers, isEmpty, isTruncated };
 }
 async function callUpstreamChat(opts: {
@@ -2200,7 +1011,7 @@ async function callUpstreamChat(opts: {
   forceStream?: boolean,
     isExternalStream: boolean,
     modelName: string
-}): Promise<{ kind:"stream", resp: Response } | { kind:"nonstream", status: number, content: string, headers: Headers, isEmpty?: boolean, isTruncated?: boolean, toolExecutions?: any[] }> {
+}): Promise<{ kind:"stream", resp: Response } | { kind:"nonstream", status: number, content: string, headers: Headers, isEmpty?: boolean, isTruncated?: boolean }> {
   const { reqId, token, body, forceStream=false, isExternalStream, modelName } = opts;
   const logCtx = { 请求ID:reqId, 模型: modelName, token: mask(token) };
 
@@ -2230,10 +1041,7 @@ async function callUpstreamChat(opts: {
   const status = resp.status;
   const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
 
-  // 对于外部流式请求，无论上游返回什么content-type都需要转换为标准SSE格式
-  // 因为上游可能返回 text/plain，需要统一处理
   if (isExternalStream && upstreamStream) {
-    // 不再直接透传，而是进行格式转换
     return { kind:"stream", resp };
   }
 
@@ -2290,62 +1098,29 @@ serve(async (req:Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
   const reqId = genReqId(req.headers);
-
-  // 仅服务端模式：跳过API_KEYS鉴权，直接透传下游的Authorization
-  const serverOnlyMode = CONFIG.serverOnly;
-  let downstreamToken: string | null = null;
-
-  if (serverOnlyMode) {
-    // 提取下游传来的token用于透传
+  if (API_KEYS.length > 0){
     const auth = req.headers.get("authorization") ?? "";
-    const xApiKey = req.headers.get("x-api-key") ?? "";
-
-    if (auth.startsWith("Bearer ")) {
-      downstreamToken = auth.slice(7);
-    } else if (xApiKey) {
-      // 支持Claude格式的x-api-key
-      downstreamToken = xApiKey;
-    }
-  } else {
-    // 正常模式：需要鉴权（支持Bearer和x-api-key两种格式）
-    if (API_KEYS.length > 0){
-      const auth = req.headers.get("authorization") ?? "";
-      const xApiKey = req.headers.get("x-api-key") ?? "";
-
-      let provided = "";
-      if (auth.startsWith("Bearer ")) {
-        provided = auth.slice(7);
-      } else if (xApiKey) {
-        provided = xApiKey;
-      }
-
-      if (!provided || !API_KEYS.includes(provided)){
-        log.warn({ 事件:"鉴权失败", 请求ID: reqId });
-        return unauthorized();
-      }
+    const provided = auth.startsWith("Bearer ")? auth.slice(7) : "";
+    if (!provided || !API_KEYS.includes(provided)){
+      log.warn({ 事件:"鉴权失败", 请求ID: reqId });
+      return unauthorized();
     }
   }
 
   stats.totalRequests++;
-  
-  // 简化日志：仅记录关键信息
-  const logData: Record<string, any> = {
-    事件:"入站请求",
-    ID:reqId,
-    方法:req.method,
-    路径:path
-  };
-  
-  // 仅在debug模式下打印详细信息
-  if (LOG_LEVEL === "debug") {
   const preview = (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")
   ? await req.clone().text().catch(()=> "")
   : "";
-    logData.请求体预览 = preview.slice(0, 200);
-    logData.UA = req.headers.get("user-agent")?.slice(0, 50) ?? "";
-  }
-  
-  log.info(logData);
+  log.info({
+    事件:"入站请求",
+    请求ID:reqId,
+    方法:req.method,
+    路径:path,
+    UA: req.headers.get("user-agent") ?? "",
+           请求体长度: preview.length,
+           请求体预览: preview.slice(0, 400),
+           当前tokens数: TOKENS.length
+  });
 
   try{
     /* 健康检查与状态 */
@@ -2357,49 +1132,35 @@ serve(async (req:Request): Promise<Response> => {
         status:"ok",
         version: "v4.0.0",
         origin: ORIGIN,
-        tokens: TOKENS.map((t, i) => ({
-          index: i,
-          token: mask(t),
-                                      is_current: i === getCurrentTokenIndex(),
-                                      usage_count: stats.tokenUsage.get(mask(t)) ?? 0
+        tokens: TOKENS.map((t, i) => ({ 
+          index: i, 
+          token: mask(t), 
+          is_current: i === getCurrentTokenIndex(),
+          usage_count: stats.tokenUsage.get(mask(t)) ?? 0
         })),
-        tokens_count: TOKENS.length,
-        current_token_index: getCurrentTokenIndex(),
+                          tokens_count: TOKENS.length,
+                          current_token_index: getCurrentTokenIndex(),
                           total_token_calls: Atomics.load(rrView,0),
-                          storage_info: {
-                            chunks: Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE),
-                            chunk_size: TOKENS_CHUNK_SIZE,
-                            estimated_size_kb: Math.round((JSON.stringify(TOKENS).length / 1024) * 100) / 100
-                          },
                           features: {
                             long_context: CONFIG.enableLongContext,
-                            thinking_injection: CONFIG.enableThinkingInjection,
-                            mcp_tools: CONFIG.enableMCP,
-                            cli_mode: CONFIG.enableCLIMode,
-                            server_only_mode: CONFIG.serverOnly,
-                            claude_api: CONFIG.enableClaudeAPI,
-                            storage: {
-                              type: STORAGE_TYPE,
-                              active: storage !== null
-                            }
+                            system_prompt: CONFIG.enableSystemPrompt,
+                            deno_kv: USE_KV && kv !== null
                           },
                           config: {
                             max_context_messages: CONFIG.maxContextMessages,
                             context_ttl_seconds: CONFIG.contextTTLSeconds,
-                            mcp_tools: CONFIG.mcpTools,
+                            system_prompt_enabled: CONFIG.enableSystemPrompt,
+                            system_prompt_length: CONFIG.systemPrompt.length,
                             sse_retry_on_empty: CONFIG.sseRetryOnEmpty,
-                            sse_min_content_length: CONFIG.sseMinContentLength,
-                            proxy_url: CONFIG.proxyUrl ? "已配置" : "未配置"
+                            sse_min_content_length: CONFIG.sseMinContentLength
                           },
                           stats: {
                             total_requests: stats.totalRequests,
                             success_requests: stats.successRequests,
                             failed_requests: stats.failedRequests,
                             success_rate: stats.totalRequests > 0 ? ((stats.successRequests / stats.totalRequests) * 100).toFixed(2) + "%" : "N/A",
-                            avg_response_time_ms: stats.avgResponseTime,
-                            total_response_count: stats.responseCount,
-                          uptime_seconds: Math.floor((Date.now() - stats.lastResetTime) / 1000),
-                          token_usage: Object.fromEntries(stats.tokenUsage)
+                            uptime_seconds: Math.floor((Date.now() - stats.lastResetTime) / 1000),
+                            token_usage: Object.fromEntries(stats.tokenUsage)
                           },
                           timeouts: { HEADER_TIMEOUT_MS, BODY_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, STREAM_TOTAL_TIMEOUT_MS },
                           retry: { RETRY_MAX, RETRY_BACKOFF_BASE_MS, RETRY_ON_STATUS: Array.from(RETRY_ON_STATUS) }
@@ -2412,14 +1173,14 @@ serve(async (req:Request): Promise<Response> => {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
-
+      
       // POST: 批量添加tokens
       if (req.method==="POST"){
         let body:any = {};
         try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-
+        
         let tokensToAdd: string[] = [];
-
+        
         // 支持两种格式：
         // 1. { "tokens": ["token1", "token2", ...] }
         // 2. { "tokens": "token1,token2,token3" } - 逗号分隔的字符串
@@ -2434,24 +1195,24 @@ serve(async (req:Request): Promise<Response> => {
         } else {
           return badRequest("`tokens` field is required.");
         }
-
+        
         if (tokensToAdd.length === 0) {
           return badRequest("No valid tokens provided.");
         }
-
+        
         const result = await addTokensBatch(tokensToAdd);
-        log.info({
-          事件:"批量添加tokens",
-          请求ID:reqId,
+        log.info({ 
+          事件:"批量添加tokens", 
+          请求ID:reqId, 
           提供数量: tokensToAdd.length,
-          添加: result.added,
+          添加: result.added, 
           跳过: result.skipped,
           失败: result.failed.length,
-          当前总数: TOKENS.length
+          当前总数: TOKENS.length 
         });
-
-        return jsonResponse({
-          ...result,
+        
+        return jsonResponse({ 
+          ...result, 
           tokens_count: TOKENS.length,
           details: {
             provided: tokensToAdd.length,
@@ -2459,14 +1220,14 @@ serve(async (req:Request): Promise<Response> => {
           }
         }, result.success ? 200 : 400);
       }
-
+      
       // DELETE: 批量删除tokens
       if (req.method==="DELETE"){
         let body:any = {};
         try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-
+        
         let tokensToRemove: string[] = [];
-
+        
         // 支持两种格式：
         // 1. { "tokens": ["token1", "token2", ...] }
         // 2. { "tokens": "token1,token2,token3" } - 逗号分隔的字符串
@@ -2481,95 +1242,43 @@ serve(async (req:Request): Promise<Response> => {
         } else {
           return badRequest("`tokens` field is required.");
         }
-
+        
         if (tokensToRemove.length === 0) {
           return badRequest("No valid tokens provided.");
         }
-
+        
         const result = await removeTokensBatch(tokensToRemove);
-        log.info({
-          事件:"批量删除tokens",
-          请求ID:reqId,
+        log.info({ 
+          事件:"批量删除tokens", 
+          请求ID:reqId, 
           提供数量: tokensToRemove.length,
-          删除: result.removed,
+          删除: result.removed, 
           未找到: result.notFound,
-          当前总数: TOKENS.length
+          当前总数: TOKENS.length 
         });
-
-        return jsonResponse({
-          ...result,
+        
+        return jsonResponse({ 
+          ...result, 
           tokens_count: TOKENS.length
         }, result.success ? 200 : 404);
       }
-
+      
       return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
-
+    
     /* 清空所有tokens - 需要管理员权限 */
-    if (path==="/v1/admin/tokens/export"){
-      if (!isAdminAuthorized(req)) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-
-      // GET: 导出所有完整tokens（不带掩码）
-      if (req.method==="GET"){
-        const url = new URL(req.url);
-        const format = url.searchParams.get("format") || "json"; // json, text, env
-        
-        log.warn({ 事件:"导出tokens", 请求ID:reqId, 数量: TOKENS.length, 格式: format });
-
-        if (format === "text") {
-          // 纯文本格式，每行一个token
-          const content = TOKENS.join("\n");
-          return new Response(content, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/plain; charset=utf-8",
-              "Content-Disposition": 'attachment; filename="tokens.txt"',
-              "x-request-id": reqId
-            }
-          });
-        } else if (format === "env") {
-          // 环境变量格式
-          const content = `FLOWITH_AUTH_TOKENS=${TOKENS.join(",")}`;
-          return new Response(content, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/plain; charset=utf-8",
-              "Content-Disposition": 'attachment; filename="tokens.env"',
-              "x-request-id": reqId
-            }
-          });
-        } else {
-          // JSON格式（默认）
-          return jsonResponse({
-            success: true,
-            tokens: TOKENS,
-            count: TOKENS.length,
-            exported_at: new Date().toISOString(),
-            format: "json"
-          }, 200, {
-            "Content-Disposition": 'attachment; filename="tokens.json"'
-          });
-        }
-      }
-
-      return badRequest("Only GET method is supported for this endpoint.");
-    }
-
     if (path==="/v1/admin/tokens/clear"){
       if (!isAdminAuthorized(req)) {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
-
+      
       if (req.method==="POST"){
         const result = await clearAllTokens();
         log.info({ 事件:"清空所有tokens", 请求ID:reqId, 清空数量: result.cleared });
         return jsonResponse(result);
       }
-
+      
       return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
 
@@ -2579,73 +1288,73 @@ serve(async (req:Request): Promise<Response> => {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
-
+      
       // GET: 列出所有tokens（带掩码和详细信息）
       if (req.method==="GET"){
         log.info({ 事件:"列出tokens", 请求ID:reqId, 数量: TOKENS.length });
         return jsonResponse({
           success: true,
-          tokens: TOKENS.map((t, i) => ({
-            index: i,
-            token: mask(t),
-                                        length: t.length,
-                                        is_current: i === getCurrentTokenIndex(),
-                                        usage_count: stats.tokenUsage.get(mask(t)) ?? 0,
-                                        next_in_queue: i === (getCurrentTokenIndex() + 1) % TOKENS.length
+          tokens: TOKENS.map((t, i) => ({ 
+            index: i, 
+            token: mask(t), 
+            length: t.length,
+            is_current: i === getCurrentTokenIndex(),
+            usage_count: stats.tokenUsage.get(mask(t)) ?? 0,
+            next_in_queue: i === (getCurrentTokenIndex() + 1) % TOKENS.length
           })),
           count: TOKENS.length,
           current_index: getCurrentTokenIndex(),
-                            total_calls: Atomics.load(rrView,0)
+          total_calls: Atomics.load(rrView,0)
         });
       }
-
+      
       // POST: 添加token
       if (req.method==="POST"){
         let body:any = {};
         try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
         const { token } = body;
         if (!token || typeof token !== "string") return badRequest("`token` is required and must be a string.");
-
+        
         const result = await addToken(token);
         log.info({ 事件:"添加token", 请求ID:reqId, 成功: result.success, 消息: result.message, 当前数量: TOKENS.length });
         return jsonResponse({ ...result, tokens_count: TOKENS.length }, result.success ? 200 : 400);
       }
-
+      
       // DELETE: 删除token
       if (req.method==="DELETE"){
         let body:any = {};
         try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
         const { token } = body;
         if (!token || typeof token !== "string") return badRequest("`token` is required and must be a string.");
-
+        
         const result = await removeToken(token);
         log.info({ 事件:"删除token", 请求ID:reqId, 成功: result.success, 消息: result.message, 当前数量: TOKENS.length });
         return jsonResponse({ ...result, tokens_count: TOKENS.length }, result.success ? 200 : 404);
       }
-
+      
       // PUT: 重置轮询索引
       if (req.method==="PUT"){
         let body:any = {};
         try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
         const { index } = body;
-
+        
         if (typeof index === "number") {
           if (index < 0 || index >= TOKENS.length) {
             return badRequest(`Index must be between 0 and ${TOKENS.length - 1}`);
           }
           resetTokenIndex(index);
           log.info({ 事件:"重置token索引", 请求ID:reqId, 新索引: index });
-          return jsonResponse({
-            success: true,
-            message: "Token index reset successfully",
+          return jsonResponse({ 
+            success: true, 
+            message: "Token index reset successfully", 
             new_index: index,
             next_token: mask(TOKENS[index])
           });
         }
-
+        
         return badRequest("`index` is required and must be a number.");
       }
-
+      
       return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
 
@@ -2655,213 +1364,23 @@ serve(async (req:Request): Promise<Response> => {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
-
+      
       const oldStats = {
         total_requests: stats.totalRequests,
         success_requests: stats.successRequests,
         failed_requests: stats.failedRequests
       };
-
+      
       stats.totalRequests = 0;
       stats.successRequests = 0;
       stats.failedRequests = 0;
       stats.tokenUsage.clear();
       stats.lastResetTime = Date.now();
-
-      await saveStatsToStorage(); // 重置后保存
-
+      
+      await saveStatsToKV(); // 重置后保存到 KV
+      
       log.info({ 事件:"重置统计信息", 请求ID:reqId, 旧统计: oldStats });
       return jsonResponse({ success: true, message: "Statistics reset successfully", old_stats: oldStats });
-    }
-
-    /* 工具执行测试API - 需要管理员权限 */
-    if (path==="/v1/admin/tools/execute"){
-      if (!isAdminAuthorized(req)) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-
-      if (req.method==="POST"){
-        let body:any = {};
-        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-        const { tool, arguments: args } = body;
-        
-        if (!tool || typeof tool !== "string") {
-          return badRequest("`tool` is required and must be a string.");
-        }
-        
-        log.info({ 事件:"测试工具执行", 请求ID:reqId, 工具: tool, 参数: args });
-        
-        const result = await executeToolCall(tool, args || {});
-        
-        return jsonResponse({
-          tool,
-          arguments: args,
-          execution: result
-        }, result.success ? 200 : 400);
-      }
-
-      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
-    }
-
-    /* 配置管理API - 需要管理员权限 */
-    if (path==="/v1/admin/config"){
-      if (!isAdminAuthorized(req)) {
-        log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
-        return forbidden();
-      }
-
-      // GET: 查看当前配置
-      if (req.method==="GET"){
-        return jsonResponse({
-          success: true,
-          config: {
-            // 基础配置（敏感信息已隐藏）
-            port: CONFIG.port,
-            logLevel: CONFIG.logLevel,
-            origin: CONFIG.origin,
-            storageType: CONFIG.storageType,
-            
-            // 超时配置
-            headerTimeoutMs: CONFIG.headerTimeoutMs,
-            bodyTimeoutMs: CONFIG.bodyTimeoutMs,
-            streamIdleTimeoutMs: CONFIG.streamIdleTimeoutMs,
-            streamTotalTimeoutMs: CONFIG.streamTotalTimeoutMs,
-            
-            // 重试配置
-            retryMax: CONFIG.retryMax,
-            retryBackoffBaseMs: CONFIG.retryBackoffBaseMs,
-            sseRetryOnEmpty: CONFIG.sseRetryOnEmpty,
-            sseMinContentLength: CONFIG.sseMinContentLength,
-            noRetryOnTimeout: CONFIG.noRetryOnTimeout,
-            
-            // 上下文配置
-            enableLongContext: CONFIG.enableLongContext,
-            maxContextMessages: CONFIG.maxContextMessages,
-            contextTTLSeconds: CONFIG.contextTTLSeconds,
-            
-            // 系统提示词配置
-            enableThinkingInjection: CONFIG.enableThinkingInjection,
-            enableSystemPromptOverride: CONFIG.enableSystemPromptOverride,
-            
-            // MCP配置
-            enableMCP: CONFIG.enableMCP,
-            mcpTools: CONFIG.mcpTools,
-            
-            // CLI模式配置
-            enableCLIMode: CONFIG.enableCLIMode,
-            availableCliTools: CLI_TOOLS.length,
-            
-            // 思考功能配置
-            enableThinkingTags: CONFIG.enableThinkingTags,
-            thinkingTagFormat: CONFIG.thinkingTagFormat,
-            
-            // 其他功能
-            serverOnly: CONFIG.serverOnly,
-            enableClaudeAPI: CONFIG.enableClaudeAPI,
-            enableStreamOptimization: CONFIG.enableStreamOptimization,
-            proxyConfigured: !!CONFIG.proxyUrl
-          }
-        });
-      }
-
-      // PATCH: 更新配置（部分更新）
-      if (req.method==="PATCH"){
-        let body:any = {};
-        try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-
-        const updates: string[] = [];
-        
-        // 允许更新的配置项
-        if (typeof body.logLevel === "string") {
-          CONFIG.logLevel = body.logLevel.toLowerCase();
-          updates.push("logLevel");
-        }
-        if (typeof body.retryMax === "number") {
-          CONFIG.retryMax = Math.max(0, body.retryMax);
-          updates.push("retryMax");
-        }
-        if (typeof body.retryBackoffBaseMs === "number") {
-          CONFIG.retryBackoffBaseMs = Math.max(0, body.retryBackoffBaseMs);
-          updates.push("retryBackoffBaseMs");
-        }
-        if (typeof body.enableLongContext === "boolean") {
-          CONFIG.enableLongContext = body.enableLongContext;
-          updates.push("enableLongContext");
-        }
-        if (typeof body.maxContextMessages === "number") {
-          CONFIG.maxContextMessages = Math.max(1, body.maxContextMessages);
-          updates.push("maxContextMessages");
-        }
-        if (typeof body.contextTTLSeconds === "number") {
-          CONFIG.contextTTLSeconds = Math.max(60, body.contextTTLSeconds);
-          updates.push("contextTTLSeconds");
-        }
-        if (typeof body.enableThinkingInjection === "boolean") {
-          CONFIG.enableThinkingInjection = body.enableThinkingInjection;
-          updates.push("enableThinkingInjection");
-        }
-        if (typeof body.thinkingPrompt === "string") {
-          CONFIG.thinkingPrompt = body.thinkingPrompt;
-          updates.push("thinkingPrompt");
-        }
-        if (typeof body.systemPrompt === "string") {
-          CONFIG.systemPrompt = body.systemPrompt;
-          updates.push("systemPrompt");
-        }
-        if (typeof body.enableSystemPromptOverride === "boolean") {
-          CONFIG.enableSystemPromptOverride = body.enableSystemPromptOverride;
-          updates.push("enableSystemPromptOverride");
-        }
-        if (typeof body.enableMCP === "boolean") {
-          CONFIG.enableMCP = body.enableMCP;
-          updates.push("enableMCP");
-        }
-        if (Array.isArray(body.mcpTools)) {
-          CONFIG.mcpTools = body.mcpTools.filter((t: any) => typeof t === "string");
-          updates.push("mcpTools");
-        }
-        if (typeof body.mcpPrompt === "string") {
-          CONFIG.mcpPrompt = body.mcpPrompt;
-          updates.push("mcpPrompt");
-        }
-        if (typeof body.enableThinkingTags === "boolean") {
-          CONFIG.enableThinkingTags = body.enableThinkingTags;
-          updates.push("enableThinkingTags");
-        }
-        if (typeof body.sseRetryOnEmpty === "boolean") {
-          CONFIG.sseRetryOnEmpty = body.sseRetryOnEmpty;
-          updates.push("sseRetryOnEmpty");
-        }
-        if (typeof body.noRetryOnTimeout === "boolean") {
-          CONFIG.noRetryOnTimeout = body.noRetryOnTimeout;
-          updates.push("noRetryOnTimeout");
-        }
-        if (typeof body.enableCLIMode === "boolean") {
-          CONFIG.enableCLIMode = body.enableCLIMode;
-          updates.push("enableCLIMode");
-        }
-        if (typeof body.cliPrompt === "string") {
-          CONFIG.cliPrompt = body.cliPrompt;
-          updates.push("cliPrompt");
-        }
-
-        if (updates.length === 0) {
-          return badRequest("No valid configuration updates provided.");
-        }
-
-        // 保存配置到存储
-        await saveConfigToStorage();
-
-        log.info({ 事件:"配置更新", 请求ID:reqId, 更新项: updates });
-        return jsonResponse({
-          success: true,
-          message: `Updated ${updates.length} configuration item(s)`,
-          updated: updates
-        });
-      }
-
-      return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
 
     /* 会话管理API - 需要管理员权限 */
@@ -2870,15 +1389,15 @@ serve(async (req:Request): Promise<Response> => {
         log.warn({ 事件:"管理员鉴权失败", 请求ID:reqId, 路径:path });
         return forbidden();
       }
-
+      
       // GET: 查看会话（需要session_id参数）
       if (req.method==="GET"){
         const sessionId = url.searchParams.get("session_id");
         if (!sessionId) return badRequest("`session_id` query parameter is required.");
-
+        
         const session = await sessionManager.getSession(sessionId);
         if (!session) return jsonResponse({ error:{ message:"Session not found" }}, 404);
-
+        
         return jsonResponse({
           success: true,
           session: {
@@ -2886,87 +1405,31 @@ serve(async (req:Request): Promise<Response> => {
             messageCount: session.messages.length,
             kbList: session.kbList ?? [],
             hasKbList: !!(session.kbList && session.kbList.length > 0),
-                            createdAt: new Date(session.createdAt).toISOString(),
-                            lastAccessedAt: new Date(session.lastAccessedAt).toISOString(),
-                            messages: session.messages.map(m => ({
-                              role: m.role,
-                              content: m.content.slice(0, 100) + (m.content.length > 100 ? "..." : ""),
-                                                                 timestamp: new Date(m.timestamp).toISOString()
-                            }))
+            createdAt: new Date(session.createdAt).toISOString(),
+            lastAccessedAt: new Date(session.lastAccessedAt).toISOString(),
+            messages: session.messages.map(m => ({
+              role: m.role,
+              content: m.content.slice(0, 100) + (m.content.length > 100 ? "..." : ""),
+              timestamp: new Date(m.timestamp).toISOString()
+            }))
           }
         });
       }
-
+      
       // DELETE: 删除会话
       if (req.method==="DELETE"){
         const sessionId = url.searchParams.get("session_id");
         if (!sessionId) return badRequest("`session_id` query parameter is required.");
-
+        
         await sessionManager.clearSession(sessionId);
         log.info({ 事件:"删除会话", 请求ID:reqId, sessionId });
         return jsonResponse({ success: true, message: "Session deleted successfully" });
       }
-
+      
       return jsonResponse({ error:{ message:"Method not allowed", type:"method_not_allowed"} }, 405);
     }
 
     if (req.method==="GET" && path==="/v1/models"){
-      // 仅服务端模式：使用下游token，不重试
-      if (serverOnlyMode) {
-        if (!downstreamToken) return unauthorized();
-
-        const logCtx = { 请求ID:reqId, 上游: URL_MODELS, token: mask(downstreamToken), 模式: "仅服务端" };
-        try{
-          const resp = await fetchWithHeaderTimeout(URL_MODELS, {
-            method:"GET",
-            headers:{
-              "Authorization": `Bearer ${downstreamToken}`,
-              "Content-Type":"application/json",
-              "X-Request-ID": reqId
-            },
-            headerTimeoutMs: HEADER_TIMEOUT_MS,
-            logCtx
-          });
-
-          let raw = "";
-          let data: any = {};
-          try {
-            raw = await withTimeout(resp.text(), BODY_TIMEOUT_MS, "upstream body timeout (models)", logCtx);
-            log.debug({ 事件:"上游响应体(models原文)", 预览: raw.slice(0,700), 长度: raw.length, ...logCtx });
-            try { data = JSON.parse(raw); } catch { data = raw; }
-          } catch (e) {
-            log.warn({ 事件:"上游读取超时(models)", 错误:String((e as any)?.message ?? e), ...logCtx });
-            data = { error: { message: "upstream read timeout" } };
-          }
-
-          if (resp.status >= 200 && resp.status < 300) {
-            let openaiFormat;
-            if (data && Array.isArray(data.models)) {
-              const now = Math.floor(Date.now() / 1000);
-              openaiFormat = {
-                object: "list",
-                data: data.models.map((modelId: string) => ({
-                  id: modelId,
-                  object: "model",
-                  created: now,
-                  owned_by: "flowith"
-                }))
-              };
-            } else if (data && data.object === "list") {
-              openaiFormat = data;
-            } else {
-              openaiFormat = { object: "list", data: [] };
-            }
-            return jsonResponse(openaiFormat, resp.status);
-          }
-
-          return jsonResponse(typeof data==='string'? { error:{ message:data } } : data, resp.status);
-        } catch (e) {
-          return gatewayError(e);
-        }
-      }
-
-      // 正常模式：使用token池和重试
       if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
 
       let attempt = 0, lastErr:any = null;
@@ -3043,152 +1506,68 @@ serve(async (req:Request): Promise<Response> => {
     }
     if (req.method==="POST" && path==="/v1/chat/completions"){
       let body:any = {}; try { body = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-      const { model, messages, stream=false, kb_list, max_tokens, max_completion_tokens, session_id, tools, tool_choice, auto_session } = body ?? {};
+      const { model, messages, stream=false, kb_list, max_tokens, max_completion_tokens, session_id, tools, tool_choice } = body ?? {};
       if (!Array.isArray(messages) || messages.length===0) return badRequest("`messages` is required and must be a non-empty array.");
-
-      // 仅服务端模式检查
-      if (serverOnlyMode && !downstreamToken) {
-        return unauthorized();
-      }
-
-      if (!serverOnlyMode && TOKENS.length === 0) {
-        return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
-      }
-
-      // ============ 自动会话检测 ============
-      // 如果启用 auto_session 或没有提供 session_id 但启用了长上下文，则自动生成会话 ID
-      let effectiveSessionId = session_id;
-      if (CONFIG.enableLongContext && (auto_session === true || (auto_session !== false && !session_id))) {
-        // 生成基于 API key + 模型的自动会话 ID
-        const apiKeyForSession = req.headers.get("authorization")?.slice(7) || req.headers.get("x-api-key") || "anonymous";
-        const modelForSession = model || "default";
-        effectiveSessionId = generateAutoSessionId(apiKeyForSession, modelForSession);
-        log.info({ 事件:"自动会话", 会话ID: effectiveSessionId, 模型: modelForSession, ...{ 请求ID: reqId } });
-      }
+      if (TOKENS.length === 0) return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
 
       let normMessages = normalizeMessages(messages);
       let finalKbList: string[];
-
+      
       // ============ kb_list 处理（必须字段，UUID v4 数组） ============
       if (Array.isArray(kb_list) && kb_list.length > 0) {
         // 用户提供了 kb_list 数组
         finalKbList = kb_list.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim());
         log.debug({ 事件:"使用提供的kb_list", kb_list: finalKbList, ...{ 请求ID: reqId } });
-      } else if (CONFIG.enableLongContext && effectiveSessionId) {
+      } else if (CONFIG.enableLongContext && session_id) {
         // 尝试从会话中获取
-        const sessionKbList = await sessionManager.getKbList(effectiveSessionId);
+        const sessionKbList = await sessionManager.getKbList(session_id);
         if (sessionKbList && sessionKbList.length > 0) {
           finalKbList = sessionKbList;
-          log.info({ 事件:"复用会话kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
+          log.info({ 事件:"复用会话kb_list", sessionId: session_id, kb_list: finalKbList, ...{ 请求ID: reqId } });
         } else {
           // 会话中没有，生成新的 UUID v4 数组
           finalKbList = [crypto.randomUUID()];
-          await sessionManager.setKbList(effectiveSessionId, finalKbList);
-          log.info({ 事件:"生成新kb_list", sessionId: effectiveSessionId, kb_list: finalKbList, ...{ 请求ID: reqId } });
+          await sessionManager.setKbList(session_id, finalKbList);
+          log.info({ 事件:"生成新kb_list", sessionId: session_id, kb_list: finalKbList, ...{ 请求ID: reqId } });
         }
       } else {
         // 没有会话，生成新的 UUID v4 数组
         finalKbList = [crypto.randomUUID()];
         log.info({ 事件:"生成新kb_list(无会话)", kb_list: finalKbList, ...{ 请求ID: reqId } });
       }
-
+      
       // ============ 长上下文支持 ============
-      if (CONFIG.enableLongContext && effectiveSessionId) {
-        const contextMessages = await sessionManager.getContext(effectiveSessionId);
+      if (CONFIG.enableLongContext && session_id) {
+        const contextMessages = await sessionManager.getContext(session_id);
         if (contextMessages.length > 0) {
           // 合并历史上下文和当前消息
           normMessages = [...contextMessages, ...normMessages];
-          log.info({ 事件:"加载会话上下文", sessionId: effectiveSessionId, 历史消息数: contextMessages.length, ...{ 请求ID: reqId } });
+          log.info({ 事件:"加载会话上下文", sessionId: session_id, 历史消息数: contextMessages.length, ...{ 请求ID: reqId } });
         }
-
+        
         // 保存当前用户消息
         const userMessage = normMessages[normMessages.length - 1];
         if (userMessage) {
-          await sessionManager.addMessage(effectiveSessionId, userMessage.role, userMessage.content, finalKbList);
+          await sessionManager.addMessage(session_id, userMessage.role, userMessage.content, finalKbList);
         }
       }
 
-      // ============ MCP工具准备 ============
-      let mcpTools;
-      
-      if (tools && tools.length > 0) {
-        // 用户明确提供了工具
-        mcpTools = tools;
-      } else if (CONFIG.enableCLIMode) {
-        // CLI模式：自动注入所有CLI工具
-        mcpTools = MCP_TOOLS.filter(t => CLI_TOOLS.includes(t.function.name));
-        log.info({ 事件:"CLI模式启用", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
-      } else if (CONFIG.enableMCP) {
-        // 普通MCP模式：根据配置注入工具
-        if (CONFIG.mcpTools.length > 0) {
-          mcpTools = MCP_TOOLS.filter(t => CONFIG.mcpTools.includes(t.function.name));
-        } else if (tool_choice) {
-          // 如果没有配置工具但指定了tool_choice，使用默认工具
-          mcpTools = MCP_TOOLS.filter(t => COMMON_TOOLS.includes(t.function.name));
-        }
-      }
-
-      // ============ 系统提示词注入 ============
-      if (normMessages.length > 0) {
-        const systemParts: string[] = [];
+      // ============ 系统提示词注入（引导正确使用工具） ============
+      if (CONFIG.enableSystemPrompt && normMessages.length > 0 && tools && tools.length > 0) {
+        // 检查是否已有system消息
+        const firstSystemIdx = normMessages.findIndex(m => m.role === "system");
         
-        // 1. 自定义系统提示词（最高优先级）
-        if (CONFIG.systemPrompt) {
-          systemParts.push(CONFIG.systemPrompt);
-          log.debug({ 事件:"注入自定义系统提示词", 长度: CONFIG.systemPrompt.length, ...{ 请求ID: reqId } });
-        }
-        
-        // 2. CLI模式提示词
-        if (CONFIG.enableCLIMode) {
-          systemParts.push(CONFIG.cliPrompt);
-          log.debug({ 事件:"注入CLI模式提示词", 长度: CONFIG.cliPrompt.length, ...{ 请求ID: reqId } });
-        }
-        
-        // 3. MCP工具提示词 + 工具调用格式
-        if (mcpTools && mcpTools.length > 0) {
-          if (CONFIG.enableCLIMode) {
-            // CLI模式：添加工具调用格式说明
-            systemParts.push(buildToolCallPrompt(mcpTools));
-            log.debug({ 事件:"注入CLI工具调用格式", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
-          } else {
-            // 普通MCP模式
-            const toolNames = mcpTools.map((t: any) => t.function.name).join(", ");
-            systemParts.push(`${CONFIG.mcpPrompt}\n\n${buildToolCallPrompt(mcpTools)}`);
-            log.debug({ 事件:"注入MCP工具提示词", 工具数: mcpTools.length, ...{ 请求ID: reqId } });
-          }
-        }
-        
-        // 4. 思考提示词
-        if (CONFIG.enableThinkingInjection) {
-          systemParts.push(CONFIG.thinkingPrompt);
-          log.debug({ 事件:"注入思考提示词", 长度: CONFIG.thinkingPrompt.length, ...{ 请求ID: reqId } });
-        }
-        
-        // 合并所有系统提示词
-        if (systemParts.length > 0) {
-          const combinedSystemPrompt = systemParts.join("\n\n");
-        const hasSystemMessage = normMessages.some(m => m.role === "system");
-
-          if (!hasSystemMessage || CONFIG.enableSystemPromptOverride) {
-            // 如果没有system消息，或者启用了覆盖模式，在最前面添加
-            if (hasSystemMessage && CONFIG.enableSystemPromptOverride) {
-              // 移除现有的system消息
-              normMessages = normMessages.filter(m => m.role !== "system");
-              log.debug({ 事件:"移除原有系统提示词(覆盖模式)", ...{ 请求ID: reqId } });
-            }
+        if (firstSystemIdx === -1) {
+          // 如果没有system消息，在最前面添加
           normMessages.unshift({
             role: "system",
-              content: combinedSystemPrompt
+            content: CONFIG.systemPrompt
           });
-            log.info({ 事件:"系统提示词已注入(前置)", 字数: combinedSystemPrompt.length, ...{ 请求ID: reqId } });
+          log.debug({ 事件:"注入系统提示词", 类型: "前置", 长度: CONFIG.systemPrompt.length, ...{ 请求ID: reqId } });
         } else {
-            // 如果已有system消息且未启用覆盖，追加到第一个system消息的内容后
-          const firstSystemIdx = normMessages.findIndex(m => m.role === "system");
-          if (firstSystemIdx !== -1) {
-              normMessages[firstSystemIdx].content += "\n\n" + combinedSystemPrompt;
-              log.info({ 事件:"系统提示词已注入(追加)", 字数: combinedSystemPrompt.length, ...{ 请求ID: reqId } });
-            }
-          }
+          // 如果已有system消息，追加到第一个system消息的内容后
+          normMessages[firstSystemIdx].content += "\n\n" + CONFIG.systemPrompt;
+          log.debug({ 事件:"注入系统提示词", 类型: "追加", 长度: CONFIG.systemPrompt.length, ...{ 请求ID: reqId } });
         }
       }
 
@@ -3199,155 +1578,69 @@ serve(async (req:Request): Promise<Response> => {
       const upstreamBody:any = {
         messages: normMessages,
         kb_list: finalKbList,  // 必须字段，UUID v4 数组
-        stream: isExternalStream,
-        ...(model? {model}:{}),
-      ...(Number.isFinite(maxTok)? { max_tokens:maxTok }:{}),
-      ...(mcpTools && mcpTools.length > 0 ? { tools: mcpTools } : {}),
-      ...(tool_choice ? { tool_choice } : {})
+      stream: isExternalStream,
+      ...(model? {model}:{}),
+        ...(Number.isFinite(maxTok)? { max_tokens:maxTok }:{}),
+        ...(tools && tools.length > 0 ? { tools } : {}),
+        ...(tool_choice ? { tool_choice } : {})
       };
-
+      
       const modelName = model ?? "flowith";
-
-      log.info({
-        事件:"聊天请求",
-        ID: reqId,
-        模型: modelName,
+      
+      log.info({ 
+        事件:"请求处理", 
+        模型: modelName, 
         消息数: normMessages.length,
-        会话: effectiveSessionId ? `${effectiveSessionId.slice(0, 8)}...` : "无",
-        工具: mcpTools?.length ?? 0,
-        流式: isExternalStream
+        会话ID: session_id ?? "无",
+        是否有会话: !!session_id,
+        kb_list: finalKbList,
+        kb_list数量: finalKbList.length,
+        工具数: tools?.length ?? 0,
+        ...{ 请求ID: reqId }
       });
-
-      // ============ 仅服务端模式：不重试，直接透传 ============
-      if (serverOnlyMode) {
-        const logCtx = {
-          请求ID:reqId,
-          模型:modelName,
-          token: mask(downstreamToken!),
-      模式: "仅服务端"
-        };
-
-        try {
-          const result = await callUpstreamChat({
-            reqId,
-            token: downstreamToken!,
-            body: upstreamBody,
-            forceStream: false,
-              isExternalStream,
-              modelName
-          });
-
-          if (result.kind === "stream") {
-            // 直接透传流式响应
-            stats.successRequests++;
-            return new Response(result.resp.body, {
-              headers: {
-                "content-type": "text/event-stream; charset=utf-8",
-                "cache-control": "no-cache, no-transform",
-                "connection": "keep-alive",
-                "x-request-id": reqId,
-                "x-server-mode": "server-only"
-              }
-            });
-          } else {
-            const { status, content, headers } = result;
-
-            if (status >= 200 && status < 300) {
-              stats.successRequests++;
-            } else {
-              stats.failedRequests++;
-            }
-
-            let responseBody;
-            try {
-              responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
-            } catch {
-              responseBody = openaiNonStream(modelName, content);
-            }
-
-            return new Response(
-              JSON.stringify(responseBody),
-                                {
-                                  status,
-                                  headers: {
-                                    "content-type": "application/json",
-                                    "x-request-id": reqId,
-                                    "x-server-mode": "server-only"
-                                  }
-                                }
-            );
-          }
-        } catch (e) {
-          stats.failedRequests++;
-          log.error({ 事件: "仅服务端模式请求失败", 错误: String((e as any)?.message ?? e), ...logCtx });
-          return gatewayError(e);
-        }
-      }
-
-      // ============ 正常模式：使用token池和重试 ============
       let attempt = 0, lastErr:any=null, lastStatus=0, lastContent="", lastHeaders:Headers|null=null;
       let needsRetry = false;
       let lastTokenIdx = -1;
-      let isTimeoutError = false; // 标记是否为超时错误
-
+      
       while (attempt <= RETRY_MAX) {
         const picked = nextToken();
         if (!picked) break;
-
+        
         const isKeySwitch = lastTokenIdx !== -1 && lastTokenIdx !== picked.idx;
         lastTokenIdx = picked.idx;
-
-        const logCtx = {
-          请求ID:reqId,
-          模型:modelName,
-          token: mask(picked.token),
-      token索引: picked.idx,
-      token总调用: picked.totalCalls,
-      尝试:attempt+1,
-      外部流:isExternalStream
+        
+        const logCtx = { 
+          请求ID:reqId, 
+          模型:modelName, 
+          token: mask(picked.token), 
+          token索引: picked.idx,
+          token总调用: picked.totalCalls,
+          尝试:attempt+1, 
+          外部流:isExternalStream 
         };
-
+        
         if (attempt > 0) {
-          log.info({
-            事件:"上游请求准备(重试)",
-                   使用token: `第${picked.idx + 1}个(共${TOKENS.length}个)`,
-                   密钥切换: isKeySwitch ? "✓ 已切换" : "未切换",
-                   ...logCtx
+          log.info({ 
+            事件:"上游请求准备(重试)", 
+            使用token: `第${picked.idx + 1}个(共${TOKENS.length}个)`,
+            密钥切换: isKeySwitch ? "✓ 已切换" : "未切换",
+            ...logCtx 
           });
         } else {
-          log.info({
-            事件:"上游请求准备",
-            使用token: `第${picked.idx + 1}个(共${TOKENS.length}个)`,
-                   ...logCtx
+          log.info({ 
+            事件:"上游请求准备", 
+            使用token: `第${picked.idx + 1}个(共${TOKENS.length}个)`, 
+            ...logCtx 
           });
         }
-
+        
         needsRetry = false;
-        isTimeoutError = false;
-
+        
         try{
-          // ============ 工具代理模式检测 ============
-          const useToolProxy = !isExternalStream && mcpTools && mcpTools.length > 0 && CONFIG.enableCLIMode;
-          
-          let result;
-          if (useToolProxy) {
-            // 使用工具代理模式（自动执行工具调用，不循环）
-            log.info({ 事件:"启用工具代理模式", 工具数: mcpTools.length, ...logCtx });
-            result = await chatWithToolProxy({
-              reqId,
-              token: picked.token,
-              body: upstreamBody,
-              modelName,
-              mcpTools
-            });
-          } else {
-            // 普通模式（不自动执行工具）
-            result = await callUpstreamChat({
+          const result = await callUpstreamChat({
             reqId, token:picked.token, body: upstreamBody,
             forceStream: false, isExternalStream, modelName
           });
-          }
-          
           if (result.kind === "stream") {
             let idleTimer: number | undefined;
             let totalTimer: number | undefined;
@@ -3367,18 +1660,63 @@ serve(async (req:Request): Promise<Response> => {
                 }
                 const reader = body.getReader();
                 let buf = "";
-                let thinkingBuffer = "";  // 用于拼凑思考内容
-                let isInThinking = false;  // 是否正在收集thinking
-                let hasOutputThinkingHeader = false;  // 是否已输出思考头部
-
+                let fullContent = ""; // 收集完整内容用于检测错误格式
+                let hasDetectedError = false;
+                
                 const safeClose = () => {
                   if (readerClosed) return;
                   readerClosed = true;
-                  // 如果还有未输出的thinking，先输出
-                  if (thinkingBuffer.trim()) {
-                    const thinkChunk = openaiChunk(modelName, `\n\n--- Response ---\n\n`);
-                    controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
+                  
+                  // 在关闭前检查是否有错误格式的工具调用
+                  if (!hasDetectedError && fullContent && hasIncorrectToolCallFormat(fullContent)) {
+                    log.warn({ 
+                      事件:"流式响应检测到错误格式", 
+                      内容预览: fullContent.slice(0, 200),
+                      ...logCtx 
+                    });
+                    hasDetectedError = true;
+                    
+                    // 尝试转换格式
+                    const converted = convertToolCallFormat(fullContent, modelName);
+                    if (converted && converted.choices[0].message.content) {
+                      log.info({ 
+                        事件:"流式响应转换工具调用格式", 
+                        工具数: converted.choices[0].message.content.filter((b: any) => b.type === "tool_use").length,
+                        ...logCtx 
+                      });
+                      
+                      // 发送转换后的内容块
+                      for (const block of converted.choices[0].message.content) {
+                        if (block.type === "text") {
+                          controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, block.text))}\n\n`));
+                        } else if (block.type === "tool_use") {
+                          // 将 tool_use 作为特殊的 delta 发送
+                          const toolChunk = {
+                            id: "chatcmpl_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10),
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: modelName,
+                            choices: [{
+                              index: 0,
+                              delta: {
+                                tool_calls: [{
+                                  id: block.id,
+                                  type: "function",
+                                  function: {
+                                    name: block.name,
+                                    arguments: JSON.stringify(block.input)
+                                  }
+                                }]
+                              },
+                              finish_reason: null
+                            }]
+                          };
+                          controller.enqueue(enc.encode(`data: ${JSON.stringify(toolChunk)}\n\n`));
+                        }
+                      }
+                    }
                   }
+                  
                   const doneObj = { id:"done", object:"chat.completion.chunk",
                     choices:[{ index:0, delta:{}, finish_reason:"stop"}],
                     created: Math.floor(Date.now()/1000), model: modelName };
@@ -3414,154 +1752,54 @@ serve(async (req:Request): Promise<Response> => {
                       resetIdle();
                       buf += dec.decode(value, { stream:true });
 
-                      // 处理多种分隔符：\n\n（SSE标准）、\n（text/plain）、}\n（JSON流）
-                      let processedAny = false;
-
-                      // 优先处理 \n\n 分隔（SSE标准格式）
                       let idx;
                       while ((idx = buf.indexOf("\n\n")) !== -1){
-                        processedAny = true;
                         const evt = buf.slice(0, idx); buf = buf.slice(idx+2);
-
-                        // 尝试解析SSE格式
                         const dataLines = evt.split("\n")
                         .map(l => l.trimEnd())
                         .filter(l => l.startsWith("data:"))
                         .map(l => l.slice(5).trim());
+                        if (dataLines.length === 0) continue;
 
-                        const data = dataLines.length > 0 ? dataLines.join("\n") : evt.trim();
-                        if (!data) continue;
-
-                        log.debug({ 事件:"上游流分片", 原文预览: data.slice(0,200), ...logCtx });
-
-                        // 检查是否为 [DONE] 标记
-                        if (data === "[DONE]") {
-                          log.debug({ 事件:"流式收到[DONE]标记", ...logCtx });
-                          safeClose();
-                          return;
-                        }
+                        const data = dataLines.join("\n");
+                        log.debug({ 事件:"上游SSE分片", 原文预览: data.slice(0,200), ...logCtx });
 
                         try{
                           const obj = JSON.parse(data);
-                          // Flowith格式处理
-                          if (obj?.tag === "seeds") {
-                            log.debug({ 事件:"流式收到seeds标记", 内容: obj.content, ...logCtx });
-                            continue;
-                          }
-
-                          if (obj?.tag === "final") {
-                            const delta = typeof obj?.content === "string" ? obj.content : String(obj.content ?? "");
-                            if (delta === "[DONE]") {
-                              log.debug({ 事件:"流式收到final+[DONE]标记", ...logCtx });
-                              safeClose();
-                              return;
+                          const delta = typeof obj?.content === "string"
+                          ? obj.content
+                          : (obj?.tag === "final" ? String(obj.content ?? "") : "");
+                          if (delta) {
+                            fullContent += delta; // 累积内容用于格式检测
+                            // 检查是否包含错误格式
+                            if (!hasDetectedError && hasIncorrectToolCallFormat(delta)) {
+                              hasDetectedError = true;
+                              log.warn({ 事件:"流中检测到错误格式", delta预览: delta.slice(0, 100), ...logCtx });
                             }
-
-                            // 检测是否为thinking内容（仅当启用时）
-                            const isThinking = CONFIG.enableThinkingTags &&
-                            (obj?.type === "thinking" || delta.includes("<think>") || delta.includes("</think>") ||
-                             delta.includes(CONFIG.thinkingStartTag) || delta.includes(CONFIG.thinkingEndTag));
-
-                            if (CONFIG.enableThinkingTags && (isThinking || isInThinking)) {
-                              isInThinking = true;
-                              thinkingBuffer += delta;
-
-                              // 输出thinking头部（只输出一次）
-                              if (!hasOutputThinkingHeader) {
-                                hasOutputThinkingHeader = true;
-                                let headerText = "";
-                                if (CONFIG.thinkingTagFormat === "markdown") {
-                                  headerText = "\n\n**Thinking:**\n\n";
-                                } else if (CONFIG.thinkingTagFormat === "custom") {
-                                  headerText = `\n${CONFIG.thinkingStartTag}\n`;
-                                } else {
-                                  headerText = `\n<thinking>\n`;
-                                }
-                                const headerChunk = openaiChunk(modelName, headerText);
-                                controller.enqueue(enc.encode(`data: ${JSON.stringify(headerChunk)}\n\n`));
-                              }
-
-                              // 立即输出thinking内容（不等待完整）
-                              if (delta) {
-                                const thinkChunk = openaiChunk(modelName, delta);
-                                controller.enqueue(enc.encode(`data: ${JSON.stringify(thinkChunk)}\n\n`));
-                              }
-
-                              // 检测thinking结束
-                              const isThinkingEnd = delta.includes("</think>") || obj?.thinking_complete ||
-                                                   delta.includes(CONFIG.thinkingEndTag);
-                              if (isThinkingEnd) {
-                                isInThinking = false;
-                                let endText = "";
-                                if (CONFIG.thinkingTagFormat === "markdown") {
-                                  endText = "\n\n**Response:**\n\n";
-                                } else if (CONFIG.thinkingTagFormat === "custom") {
-                                  endText = `\n${CONFIG.thinkingEndTag}\n\n`;
-                                } else {
-                                  endText = `\n</thinking>\n\n`;
-                                }
-                                const endChunk = openaiChunk(modelName, endText);
-                                controller.enqueue(enc.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
-                              }
-                            } else {
-                              // 正常内容
-                              if (delta) {
-                                // 性能优化：复用chunk对象
-                                if (CONFIG.enableStreamOptimization) {
-                                  controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
-                                } else {
-                                  const chunk = openaiChunk(modelName, delta);
-                                  controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                }
-                              }
-                            }
-                          } else {
-                            // 其他格式兼容
-                            const delta = typeof obj?.content === "string" ? obj.content : "";
-                            if (delta) {
-                              const chunk = openaiChunk(modelName, delta);
-                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            // 如果还没检测到错误，正常发送
+                            if (!hasDetectedError) {
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
                             }
                           }
+                          if (obj?.tag === "final") { safeClose(); return; }
                         }catch{
-                          // JSON解析失败，尝试作为纯文本处理
                           const { delta, isFinal } = extractDeltaFromTextChunk(data);
-                          if (delta && delta !== "[DONE]") {
-                            const chunk = openaiChunk(modelName, delta);
-                            controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                          }
-                          if (isFinal || delta === "[DONE]") { safeClose(); return; }
-                        }
-                      }
-
-                      // 如果没有处理 \n\n 分隔符，尝试处理单个 \n（纯文本流）
-                      if (!processedAny && buf.includes("\n")) {
-                        const lines = buf.split("\n");
-                        buf = lines.pop() || "";  // 保留最后一行（可能不完整）
-
-                        for (const line of lines) {
-                          const trimmed = line.trim();
-                          if (!trimmed) continue;
-
-                          // 尝试解析JSON
-                          try {
-                            const obj = JSON.parse(trimmed);
-                            if (obj?.content) {
-                              const chunk = openaiChunk(modelName, obj.content);
-                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                          if (delta) {
+                            fullContent += delta; // 累积内容
+                            if (!hasDetectedError && hasIncorrectToolCallFormat(delta)) {
+                              hasDetectedError = true;
+                              log.warn({ 事件:"流中检测到错误格式", delta预览: delta.slice(0, 100), ...logCtx });
                             }
-                          } catch {
-                            // 作为纯文本处理
-                            if (trimmed && trimmed !== "[DONE]") {
-                              const chunk = openaiChunk(modelName, trimmed);
-                              controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            if (!hasDetectedError) {
+                              controller.enqueue(enc.encode(`data: ${JSON.stringify(openaiChunk(modelName, delta))}\n\n`));
                             }
                           }
+                          if (isFinal) { safeClose(); return; }
                         }
                       }
                     }
                   } catch (e) {
-                    log.warn({ 事件:"上游流读取异常", 错误:String((e as any)?.message ?? e), ...logCtx });
+                    log.warn({ 事件:"上游SSE读取异常", 错误:String((e as any)?.message ?? e), ...logCtx });
                   } finally {
                     safeClose();
                   }
@@ -3569,7 +1807,7 @@ serve(async (req:Request): Promise<Response> => {
             });
 
             stats.successRequests++;
-            await saveStatsToStorage(); // 流式成功时保存统计
+            await saveStatsToKV(); // 流式成功时保存统计
             return new Response(readable, {
               headers:{
                 "content-type":"text/event-stream; charset=utf-8",
@@ -3580,33 +1818,33 @@ serve(async (req:Request): Promise<Response> => {
             });
           } else {
             const { status, content, headers, isEmpty, isTruncated } = result;
-
+            
             // 检查是否需要重试
             let shouldRetry = false;
             let retryReason = "";
-
+            
             // 1. 检查 SSE 空返回或截断
             if ((isEmpty || isTruncated) && SSE_RETRY_ON_EMPTY && attempt < RETRY_MAX) {
               shouldRetry = true;
               retryReason = isEmpty ? "返回为空" : "数据截断";
             }
-
+            
             // 2. 检查上游错误状态码（如果配置了可重试的状态码）
             if (!shouldRetry && status >= 400 && RETRY_ON_STATUS.has(status) && attempt < RETRY_MAX) {
               shouldRetry = true;
               retryReason = `上游返回错误状态 ${status}`;
             }
-
+            
             if (shouldRetry) {
-              log.warn({
-                事件:"准备重试",
+              log.warn({ 
+                事件:"准备重试", 
                 原因: retryReason,
                 状态: status,
                 字数: content.length,
                 当前尝试: attempt + 1,
                 最大尝试: RETRY_MAX + 1,
                 下次将切换密钥: TOKENS.length > 1 ? "是(负载均衡)" : "否(仅1个key)",
-                       ...logCtx
+                ...logCtx
               });
               needsRetry = true;
               lastContent = content;
@@ -3614,87 +1852,87 @@ serve(async (req:Request): Promise<Response> => {
               lastHeaders = headers;
             } else {
               // 不需要重试或已达到最大重试次数
-              log.info({
-                事件:"下游返回(OpenAI非流式)",
-                       状态: status,
-                       字数: content.length,
-                       是否为空: isEmpty,
-                       是否截断: isTruncated,
-                       是否重试过: attempt > 0,
-                       总尝试次数: attempt + 1,
-                       ...logCtx
+              log.info({ 
+                事件:"下游返回(OpenAI非流式)", 
+                状态: status, 
+                字数: content.length,
+                是否为空: isEmpty,
+                是否截断: isTruncated,
+                是否重试过: attempt > 0,
+                总尝试次数: attempt + 1,
+                ...logCtx 
               });
-
+              
               if (status >= 200 && status < 300 && !isEmpty) {
                 stats.successRequests++;
-                await saveStatsToStorage(); // 成功时保存统计
-
+                await saveStatsToKV(); // 成功时保存统计
+                
                 // 保存助手回复到会话
-                if (CONFIG.enableLongContext && effectiveSessionId && content) {
-                  await sessionManager.addMessage(effectiveSessionId, "assistant", content);
-                  log.debug({ 事件:"保存助手回复", sessionId: effectiveSessionId, 字数: content.length, 自动会话: effectiveSessionId && !session_id, ...{ 请求ID: reqId } });
+                if (CONFIG.enableLongContext && session_id && content) {
+                  await sessionManager.addMessage(session_id, "assistant", content);
+                  log.debug({ 事件:"保存助手回复", sessionId: session_id, 字数: content.length, ...{ 请求ID: reqId } });
                 }
               } else {
                 stats.failedRequests++;
-                await saveStatsToStorage();
-              }
-
-              // 透传上游的错误状态和内容
-              let responseBody;
-              try {
-                // 尝试解析为 JSON（上游可能返回结构化错误）
-                responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
-              } catch {
-                // 解析失败，包装为标准格式
-                responseBody = openaiNonStream(modelName, content);
+                await saveStatsToKV();
               }
               
-              // 如果有工具执行结果，添加到响应中
-              if (result.toolExecutions && result.toolExecutions.length > 0) {
-                responseBody.tool_executions = result.toolExecutions;
+              // ============ 检查并转换错误的工具调用格式 ============
+              let responseBody;
+              if (status >= 200 && status < 300 && content && hasIncorrectToolCallFormat(content)) {
+                log.warn({ 
+                  事件:"检测到错误的工具调用格式", 
+                  内容预览: content.slice(0, 200),
+                  ...logCtx 
+                });
+                
+                const converted = convertToolCallFormat(content, modelName);
+                if (converted) {
+                  log.info({ 
+                    事件:"已转换工具调用格式", 
+                    工具数: converted.choices[0].message.content.filter((b: any) => b.type === "tool_use").length,
+                    ...logCtx 
+                  });
+                  responseBody = converted;
+                } else {
+                  // 转换失败，使用原内容
+                  try {
+                    responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
+                  } catch {
+                    responseBody = openaiNonStream(modelName, content);
+                  }
+                }
+              } else {
+                // 透传上游的错误状态和内容
+                try {
+                  // 尝试解析为 JSON（上游可能返回结构化错误）
+                  responseBody = content ? JSON.parse(content) : openaiNonStream(modelName, content);
+                } catch {
+                  // 解析失败，包装为标准格式
+                  responseBody = openaiNonStream(modelName, content);
+                }
               }
-
-              return new Response(
+              
+            return new Response(
                 JSON.stringify(responseBody),
-                                  { status, headers: {
-                                    "content-type":"application/json",
-                                    "x-request-id": reqId,
-                                    "x-retry-attempts": String(attempt + 1),
-                                    "x-tool-calls": result.toolExecutions && result.toolExecutions.length > 0 ? String(result.toolExecutions.length) : "0"
-                                  }}
+                { status, headers: { 
+                  "content-type":"application/json", 
+                  "x-request-id": reqId,
+                  "x-retry-attempts": String(attempt + 1)
+                }}
               );
             }
           }
         } catch (e) {
           lastErr = e;
-          const errorMsg = String((e as any)?.message ?? e);
-          
-          // 检查是否为超时错误
-          isTimeoutError = errorMsg.includes("timeout") || errorMsg.includes("Timeout") || 
-                          errorMsg.includes("TIMEOUT") || errorMsg.includes("timed out");
-          
-          // 如果是超时错误且配置了不重试，则直接退出
-          if (isTimeoutError && CONFIG.noRetryOnTimeout) {
-            log.error({
-              事件:"超时错误(不重试)",
-              错误: errorMsg,
-              配置: "NO_RETRY_ON_TIMEOUT=true",
-              尝试: attempt + 1,
-              ...{ 请求ID:reqId }
-            });
-            needsRetry = false;
-            break; // 直接退出循环
-          }
-          
           needsRetry = true;
-          log.warn({
-            事件:"上游调用异常(重试点)",
-                   错误: errorMsg,
-                   是否超时: isTimeoutError,
-                   堆栈: (e as any)?.stack?.split('\n').slice(0, 3).join(' '),
-                   尝试:attempt+1,
-                   下次将切换密钥: TOKENS.length > 1 && attempt < RETRY_MAX ? "是(负载均衡)" : "否",
-                   ...{ 请求ID:reqId }
+          log.warn({ 
+            事件:"上游调用异常(重试点)", 
+            错误:String((e as any)?.message ?? e), 
+            堆栈: (e as any)?.stack?.split('\n').slice(0, 3).join(' '),
+            尝试:attempt+1,
+            下次将切换密钥: TOKENS.length > 1 && attempt < RETRY_MAX ? "是(负载均衡)" : "否",
+            ...{ 请求ID:reqId } 
           });
         }
 
@@ -3703,39 +1941,39 @@ serve(async (req:Request): Promise<Response> => {
 
         attempt++;
         if (attempt > RETRY_MAX) break;
-
+        
         // 预测下一个将使用的密钥（用于日志显示）
         const nextKeyIdx = Atomics.load(rrView, 0) % TOKENS.length;
         const nextKeyPreview = TOKENS.length > 0 ? `第${nextKeyIdx + 1}个(${mask(TOKENS[nextKeyIdx])})` : "无";
-
+        
         const backoffMs = RETRY_BACKOFF_BASE_MS * Math.pow(2, attempt - 1); // 指数退避
-        log.info({
-          事件:"重试退避",
-          延迟毫秒: backoffMs,
+        log.info({ 
+          事件:"重试退避", 
+          延迟毫秒: backoffMs, 
           下次尝试: attempt+1,
           下次密钥: TOKENS.length > 1 ? nextKeyPreview : "无切换",
-          ...{ 请求ID:reqId }
+          ...{ 请求ID:reqId } 
         });
         if (backoffMs > 0) await delay(backoffMs);
       }
 
       stats.failedRequests++;
-      await saveStatsToStorage(); // 失败时也保存统计
-
+      await saveStatsToKV(); // 失败时也保存统计
+      
       // 透传最后的错误状态和信息
       log.error({
         事件:"所有重试失败",
         总尝试次数: attempt + 1,
         最后状态: lastStatus,
         最后错误: lastErr ? String((lastErr as any)?.message ?? lastErr) : "无",
-                内容长度: lastContent?.length ?? 0,
-                请求ID: reqId
+        内容长度: lastContent?.length ?? 0,
+        请求ID: reqId
       });
-
+      
       if (lastErr) {
         return gatewayError(lastErr);
       }
-
+      
       if (lastStatus && lastContent) {
         // 尝试透传上游的原始错误响应
         let errorBody;
@@ -3746,167 +1984,41 @@ serve(async (req:Request): Promise<Response> => {
           errorBody = {
             error: {
               message: lastContent.slice(0, 500),
-      type: "upstream_error",
-      status: lastStatus
+              type: "upstream_error",
+              status: lastStatus
             }
           };
         }
-
+        
         return new Response(
           JSON.stringify(errorBody),
-                            {
-                              status: lastStatus,
-                              headers: {
-                                "content-type": "application/json",
-                                "x-request-id": reqId,
-                                "x-retry-attempts": String(attempt + 1),
-                            "x-all-retries-failed": "true"
-                              }
-                            }
+          { 
+            status: lastStatus, 
+            headers: { 
+              "content-type": "application/json", 
+              "x-request-id": reqId,
+              "x-retry-attempts": String(attempt + 1),
+              "x-all-retries-failed": "true"
+            }
+          }
         );
       }
-
+      
       if (lastStatus) {
-        return jsonResponse({
-          error:{
+        return jsonResponse({ 
+          error:{ 
             message: `HTTP ${lastStatus}`,
             type: "upstream_error",
             status: lastStatus
           }
-        }, lastStatus, {
+        }, lastStatus, { 
           "x-request-id": reqId,
           "x-retry-attempts": String(attempt + 1),
-                            "x-all-retries-failed": "true"
+          "x-all-retries-failed": "true"
         });
       }
-
+      
       return gatewayTimeout("REQUEST_TIMED_OUT");
-    }
-
-    // Claude API 兼容端点：/v1/messages
-    if (req.method==="POST" && path==="/v1/messages" && CONFIG.enableClaudeAPI){
-      const requestStartTime = Date.now();
-      let claudeBody:any = {};
-      try { claudeBody = await req.json(); } catch { return badRequest("Invalid JSON body."); }
-
-      const { model, messages, system, max_tokens, stream: claudeStream, temperature, top_p } = claudeBody ?? {};
-      if (!Array.isArray(messages) || messages.length===0) {
-        return badRequest("`messages` is required and must be a non-empty array.");
-      }
-
-      // 仅服务端模式检查
-      if (serverOnlyMode && !downstreamToken) {
-        return unauthorized();
-      }
-
-      if (!serverOnlyMode && TOKENS.length === 0) {
-        return jsonResponse({ error:{ message:"No tokens configured" }}, 429);
-      }
-
-      // 转换为 OpenAI 格式
-      const convertedMessages = normalizeMessages(messages);
-      const finalMessages = system && typeof system === "string"
-      ? [{ role: "system", content: system }, ...convertedMessages]
-      : convertedMessages;
-
-      // 构造转发请求到 /v1/chat/completions
-      const openaiBody = {
-            model: model ?? "claude-3-5-sonnet",
-            messages: finalMessages,
-        stream: claudeStream ?? false,
-        max_tokens: max_tokens,
-        temperature,
-        top_p
-      };
-
-      log.info({
-        事件: "Claude API请求",
-        ID: reqId,
-        模型: openaiBody.model,
-        消息数: finalMessages.length,
-        流式: openaiBody.stream
-      });
-
-      // 内部转发到 chat/completions 处理逻辑
-      // 重用现有的处理逻辑
-      const normMessages = finalMessages;
-      const finalKbList: string[] = [crypto.randomUUID()];
-      const isExternalStream = !!openaiBody.stream;
-      const modelName = openaiBody.model;
-
-      const upstreamBody:any = {
-        messages: normMessages,
-        kb_list: finalKbList,
-        stream: isExternalStream,
-        model: modelName,
-        ...(openaiBody.max_tokens ? { max_tokens: openaiBody.max_tokens } : {})
-      };
-
-      // 简化处理：仅使用第一个token或下游token
-      const picked = serverOnlyMode ? null : nextToken();
-      const useToken = serverOnlyMode ? downstreamToken! : (picked ? picked.token : null);
-
-      if (!useToken) {
-        return jsonResponse({ error:{ message:"No tokens available" }}, 503);
-      }
-
-      try {
-        const result = await callUpstreamChat({
-          reqId,
-          token: useToken,
-          body: upstreamBody,
-          forceStream: false,
-          isExternalStream,
-          modelName
-        });
-
-        const elapsed = Date.now() - requestStartTime;
-        recordResponseTime(elapsed);
-
-        if (result.kind === "stream") {
-          stats.successRequests++;
-          return new Response(result.resp.body, {
-            headers: {
-              "content-type": "text/event-stream; charset=utf-8",
-              "cache-control": "no-cache, no-transform",
-              "connection": "keep-alive",
-              "x-request-id": reqId,
-              "anthropic-version": "2023-06-01"
-            }
-          });
-        } else {
-          const { status, content } = result;
-
-          if (status >= 200 && status < 300) {
-            stats.successRequests++;
-            // 转换为 Claude 格式响应
-            return jsonResponse({
-              id: "msg_" + crypto.randomUUID().replace(/-/g, ''),
-              type: "message",
-              role: "assistant",
-              content: [{ type: "text", text: content }],
-              model: modelName,
-              stop_reason: "end_turn",
-              usage: {
-                input_tokens: 0,
-                output_tokens: 0
-              }
-            }, status, {
-              "x-request-id": reqId,
-              "anthropic-version": "2023-06-01"
-            });
-          } else {
-            stats.failedRequests++;
-            return jsonResponse({ error:{ message: content || "Upstream error", type:"api_error" }}, status);
-          }
-        }
-      } catch (e) {
-        stats.failedRequests++;
-        const elapsed = Date.now() - requestStartTime;
-        recordResponseTime(elapsed);
-        log.error({ 事件: "Claude API请求失败", ID: reqId, 错误: String((e as any)?.message ?? e), 耗时ms: elapsed });
-        return gatewayError(e);
-      }
     }
 
     stats.failedRequests++;
@@ -3918,24 +2030,17 @@ serve(async (req:Request): Promise<Response> => {
   }
 }, { port: PORT });
 
-const rsyncMode = getEnv("RSYNC", "0").trim() === "1";
+const rsyncMode = (Deno.env.get("RSYNC") ?? "0").trim() === "1";
 log.info({
   事件:"服务启动",
   端口: PORT,
   ORIGIN,
   TOKENS数量: TOKENS.length,
   TOKENS预览: TOKENS.slice(0, 3).map(mask),
-         存储类型: STORAGE_TYPE,
-         存储状态: storage !== null ? "已启用" : "未启用",
-         存储分片: storage !== null ? `${Math.ceil(TOKENS.length / TOKENS_CHUNK_SIZE)}片 (每片${TOKENS_CHUNK_SIZE}个)` : "N/A",
-         同步模式: rsyncMode ? "完全同步(RSYNC=1)" : "差异同步",
-         功能: {
-           长上下文: CONFIG.enableLongContext,
-           思考注入: CONFIG.enableThinkingInjection,
-           MCP工具: CONFIG.enableMCP,
-           CLI模式: CONFIG.enableCLIMode,
-           CLI工具数: CONFIG.enableCLIMode ? CLI_TOOLS.length : 0,
-           仅服务端模式: CONFIG.serverOnly,
-           Claude_API: CONFIG.enableClaudeAPI
-         }
+  KV存储: USE_KV && kv !== null ? "已启用" : "未启用",
+  同步模式: rsyncMode ? "完全同步(RSYNC=1)" : "差异同步",
+  功能: {
+    长上下文: CONFIG.enableLongContext,
+    系统提示词: CONFIG.enableSystemPrompt
+  }
 });
